@@ -8,9 +8,25 @@ smooth component (H0: the curve is linear).
 
 ## Install
 
+**From GitHub, without cloning.** `torchamm` currently lives in a subdirectory of the
+research repo, so point pip at that subdirectory:
+
 ```bash
-pip install -e .            # from this folder
-pip install -e ".[examples]"   # + matplotlib/jupyter for the vignette
+pip install "git+https://github.com/rrrrn/Linear-Mixed-Effects-Fit-via-Torch.git#subdirectory=torchamm"
+
+# with the example deps (matplotlib/jupyter for the vignette):
+pip install "torchamm[examples] @ git+https://github.com/rrrrn/Linear-Mixed-Effects-Fit-via-Torch.git#subdirectory=torchamm"
+```
+
+If `torchamm` is later split into its own repo, this simplifies to
+`pip install git+https://github.com/<user>/torchamm.git`.
+
+**From a local clone (editable, for development):**
+
+```bash
+cd torchamm
+pip install -e .                 # core
+pip install -e ".[examples,test]"   # + matplotlib/jupyter + pytest
 ```
 
 ## Quickstart
@@ -38,10 +54,10 @@ ss.linearity_test(s=0)       # score test, H0: component 0 is linear
 ```
 
 See [`examples/quickstart.ipynb`](examples/quickstart.ipynb) for an end-to-end vignette
-with plots, and the methodology notes in [`docs/`](docs/):
-[`methods.md`](docs/methods.md) (model + scalable REML),
-[`linearity_test.md`](docs/linearity_test.md) (the linearity score test), and
-[`optimization_scheme.md`](docs/optimization_scheme.md).
+with plots. For the methodology (model, scalable REML, the linearity score test), see:
+
+<!-- TODO: link your paper / project page here -->
+- Paper / project: **TODO**
 
 ## Public API
 
@@ -52,6 +68,13 @@ with plots, and the methodology notes in [`docs/`](docs/):
 | `SmoothingSpline` | a single penalized smoothing spline |
 | `SmoothingSplineMixed` | smoothing-spline mixed model (high-level API) |
 | `lrt_test` | likelihood-ratio test between two fitted models |
+
+## Citation
+
+If you use `torchamm`, please cite: **TODO**
+
+```bibtex
+```
 
 ## License
 
