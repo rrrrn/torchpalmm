@@ -1,0 +1,41 @@
+[project]
+name = "torchamm"
+description = "Scalable REML for additive smooth (penalized-spline) mixed models on PyTorch."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+# TODO: fill in author name/email
+authors = [{ name = "TODO", email = "TODO" }]
+keywords = ["mixed-models", "smoothing-splines", "REML", "pytorch", "GAMM", "variance-components"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "torch",
+    "numpy",
+    "scipy",
+    "pandas",
+    "tqdm",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+examples = ["matplotlib", "jupyter"]
+test = ["pytest"]
+
+[project.urls]
+# TODO: fill in once the repo is public
+Homepage = "TODO"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = { attr = "torchamm.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["torchamm*"]
