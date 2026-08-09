@@ -8,22 +8,19 @@ smooth component (H0: the curve is linear).
 
 ## Install
 
-**From GitHub, without cloning.** `torchamm` currently lives in a subdirectory of the
-research repo, so point pip at that subdirectory:
+**From GitHub, without cloning:**
 
 ```bash
-pip install "git+https://github.com/rrrrn/Linear-Mixed-Effects-Fit-via-Torch.git#subdirectory=torchamm"
+pip install git+https://github.com/rrrrn/torchamm.git
 
 # with the example deps (matplotlib/jupyter for the vignette):
-pip install "torchamm[examples] @ git+https://github.com/rrrrn/Linear-Mixed-Effects-Fit-via-Torch.git#subdirectory=torchamm"
+pip install "torchamm[examples] @ git+https://github.com/rrrrn/torchamm.git"
 ```
-
-If `torchamm` is later split into its own repo, this simplifies to
-`pip install git+https://github.com/<user>/torchamm.git`.
 
 **From a local clone (editable, for development):**
 
 ```bash
+git clone https://github.com/rrrrn/torchamm.git
 cd torchamm
 pip install -e .                 # core
 pip install -e ".[examples,test]"   # + matplotlib/jupyter + pytest
@@ -53,8 +50,16 @@ ss.fixed_t_test(0)           # test a fixed covariate
 ss.linearity_test(s=0)       # score test, H0: component 0 is linear
 ```
 
-See [`examples/quickstart.ipynb`](examples/quickstart.ipynb) for an end-to-end vignette
-with plots. For the methodology (model, scalable REML, the linearity score test), see:
+Two notebooks in [`examples/`](examples):
+
+- [`quickstart.ipynb`](examples/quickstart.ipynb) — the two-minute tour: one LMM, one
+  smoothing-spline mixed model, with plots.
+- [`vignette.ipynb`](examples/vignette.ipynb) — the full walkthrough: unstructured random
+  effects and the Satterthwaite coefficient table, model selection with `lrt_test`,
+  the `iid`/`cs`/`ar1`/`exp` residual correlation structures, subject-level BLUPs,
+  several additive smooths in one model, the linearity score test, and scaling behaviour.
+
+For the methodology (model, scalable REML, the linearity score test), see:
 
 <!-- TODO: link your paper / project page here -->
 - Paper / project: **TODO**

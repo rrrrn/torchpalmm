@@ -69,7 +69,9 @@ class LinearMixedModel:
         elif correlation.lower() in ["independent", "diagonal"]:
             return elements * torch.ones(nmax, device=elements.device, dtype=elements.dtype)
         elif correlation.lower() in ["compoundsymmetry", "cs"]:
-            return torch.tensor([0, elements], device=elements.device, dtype=elements.dtype)
+            # param[0]=sqrt(0.75)*σ (private), param[1]=0.5*σ (shared) → rho_init≈0.25, sigma2_init=σ².
+            return torch.tensor([0.75**0.5 * elements, 0.5 * elements],
+                                device=elements.device, dtype=elements.dtype)
         elif correlation.lower() in ["ar1", "autoregressive"]:
             rho = 0
             return torch.tensor([elements, rho], device=elements.device, dtype=elements.dtype)
@@ -90,7 +92,8 @@ class LinearMixedModel:
         elif correlation_structure.lower() in ["independent", "diagonal"]:
             D =  torch.diag(param**2).to(device=param.device, dtype=self.y_.dtype)
         elif correlation_structure.lower() in ["compoundsymmetry", "cs"]:
-            D =  param[0]**2 * torch.ones((n, n), device=param.device) + (param[1]**2 - param[0]**2) * torch.eye(n, device=param.device).to(device=param.device, dtype=self.y_.dtype)
+            # param[0]²·I (private) + param[1]²·J (shared): always PSD, rho=param[1]²/(param[0]²+param[1]²).
+            D = param[0]**2 * torch.eye(n, device=param.device, dtype=self.y_.dtype) + param[1]**2 * torch.ones((n, n), device=param.device, dtype=self.y_.dtype)
         elif correlation_structure.lower() in ["ar1", "autoregressive"]:
             rho = torch.tanh(param[1])
             indices = torch.arange(n, device=param.device)
@@ -123,16 +126,12 @@ class LinearMixedModel:
             else:
                 self.L_elements = torch.ones(pz * (pz + 1) // 2, requires_grad=True, device=self.device)
                 self.L_elements = torch.nn.Parameter(self.L_elements)
-
-            # self.D = self.construct_lower_triangular_matrix(self.L_elements, pz) @ self.construct_lower_triangular_matrix(self.L_elements, pz).T
         elif type == "diagonal":
             self.L_elements = torch.ones(pz, requires_grad=True, device=self.device)
             self.L_elements = torch.nn.Parameter(self.L_elements)
-            # self.D = torch.diag(self.L_elements**2)
         elif type == "iid":
             self.L_elements = torch.ones(1, requires_grad=True, device=self.device)
             self.L_elements = torch.nn.Parameter(self.L_elements)
-            # self.D = (self.L_elements**2) * torch.eye(pz, device=self.device)
 
     def __init__(self, device = 'cpu', y=None, X=None, Z=None, id=None, corr_structure=None, rand_D_type="unstructured", rand_D_estimate="sample"):
         if device is None:
@@ -202,6 +201,20 @@ class LinearMixedModel:
 
         else:
             raise ValueError(f"Matrix must be 2D or 3D square, got shape {X.shape}")
+
+    @staticmethod
+    def _robust_cholesky(M, eye, n_tries=10):
+        # CS line-search points can drive V indefinite; progressive jitter recovers it.
+        scale = torch.diagonal(M, dim1=-2, dim2=-1).mean().detach().clamp_min(1.0)
+        jitter = 1e-8 * scale
+        for _ in range(n_tries):
+            Mj = M + jitter * eye
+            L, info = torch.linalg.cholesky_ex(Mj)
+            if not info.any():
+                return L, Mj
+            jitter = jitter * 10.0
+        Mj = M + jitter * eye
+        return torch.linalg.cholesky(Mj), Mj
             
     @staticmethod   
     def convg_check(prev, curr, tol=1e-6):
@@ -278,7 +291,6 @@ class LinearMixedModel:
                     Vi = Vi + jitter * I
                     break
                 jitter *= 10.0
-            # LVi = torch.linalg.cholesky(Vi)  # [G, nmax, nmax]
 
             Vinv_X = torch.cholesky_solve(X_eff, LVi)                # [G, nmax, px]
             Vinv_y = torch.cholesky_solve(y_eff.unsqueeze(-1), LVi)  # [G, nmax, 1]
@@ -332,10 +344,9 @@ class LinearMixedModel:
         mask_mat = self.mask.unsqueeze(-1) * self.mask.unsqueeze(-2)  # [G, nmax, nmax]
         Vi = V_full * mask_mat + (1 - mask_mat) * self.eye_nmax * 1e6
 
-        Vi = self.stablize_tensor(Vi)
         e = self.y_grouped - (self.X_grouped @ beta.to( device=self.device)).squeeze(-1)  # [G, nmax]
 
-        LVi = torch.linalg.cholesky(Vi)  # [G, nmax, nmax]
+        LVi, Vi = self._robust_cholesky(Vi, self.eye_nmax)  # [G, nmax, nmax]
 
         e_exp = e.unsqueeze(-1)  # [G, nmax, 1]
         Vinv_e = torch.cholesky_solve(e_exp, LVi)  # [G, nmax, 1]
@@ -414,8 +425,7 @@ class LinearMixedModel:
             V_full = Sigma + ZDZ
 
             V = V_full * mask_mat + (1.0 - mask_mat) * self.eye_nmax * 1e6  # [G, nmax, nmax]
-            V = self.stablize_tensor(V)
-            L = torch.linalg.cholesky(V)                   # [G, nmax, nmax]
+            L, V = self._robust_cholesky(V, self.eye_nmax)  # [G, nmax, nmax]
 
             logdetV = 2 * torch.sum(torch.log(torch.diagonal(L, dim1=1, dim2=2)), dim=1)  # [G]
             logdetV_sum = torch.sum(logdetV)
@@ -448,7 +458,6 @@ class LinearMixedModel:
         D = self.param_to_sqmatrix(self.L_elements, n=self.pz, correlation_structure=self.rand_D_type)
         opt.zero_grad()
         total_loss = loss_function(sigma2=sigma2, D=D)
-        torch.autograd.set_detect_anomaly(True)
         total_loss.backward()
         opt.step()
 
@@ -752,6 +761,101 @@ class LinearMixedModel:
         else:
             l_vec = torch.as_tensor(l, device=self.device, dtype=self.y_.dtype).reshape(px, 1)
         return self._contrast_test(l_vec, theta_hat, A)
+
+    ##########################################
+    ### Hypothesis testing for random effects
+    ##########################################
+    # Boundary score test (Lin 1997; Zhang & Lin 2003): U = S+ - e at H0,
+    # S+ = 1/2 ||Z_idx' P0 y||^2, matched to a scaled chi-square a*chi2_b.
+    # See docs/linearity_test.md.
+
+    def _chol_group_cov(self, V):
+        mask_vec = self.mask.unsqueeze(-1)
+        mask_mat = mask_vec @ mask_vec.transpose(1, 2)
+        V = V * mask_mat + (1.0 - mask_mat) * self.eye_nmax * 1e6
+        V = 0.5 * (V + V.transpose(-1, -2))
+        I = torch.eye(self.nmax, device=self.device, dtype=self.y_.dtype)
+        jitter = 1e-10
+        for _ in range(8):
+            L, info = torch.linalg.cholesky_ex(V + jitter * I)
+            if (info == 0).all():
+                return L
+            jitter *= 10.0
+        return L
+
+    def _random_effect_null_cov(self, idx, null_fit_kwargs=None):
+        if type(self) is not LinearMixedModel:
+            raise NotImplementedError(
+                "random_effect_test assumes V = R + Z D Z^T with no other "
+                "covariance terms; it is not valid on subclasses that add their "
+                "own (e.g. LinearMixedModelSmoothing -- use linearity_test there)."
+            )
+        keep = [j for j in range(self.pz) if j not in idx]
+        if not keep:
+            raise ValueError("random_effect_test needs at least one other random "
+                              "effect left under the null; compare a no-random-"
+                              "effects fit with lrt_test instead.")
+        nfk = dict(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=200,
+                   verbose=False, convg_check="loss")
+        if null_fit_kwargs:
+            nfk.update(null_fit_kwargs)
+
+        null = LinearMixedModel(device=self.device, y=self.y_, X=self.X_, Z=self.Z_[:, keep],
+                                id=self.id_, corr_structure=self.corr_structure,
+                                rand_D_type=self.rand_D_type, rand_D_estimate=self.rand_D_estimate)
+        null.fit_likelihood(optimizer=nfk["optimizer"], lr=nfk["lr"], max_iter=nfk["max_iter"],
+                            fit_type="REML", convg_check=nfk["convg_check"], verbose=nfk["verbose"])
+
+        Z_keep = self.masked_Z[:, :, keep]
+        ZDZ = Z_keep @ null.D @ Z_keep.transpose(-1, -2)
+        V0 = null.sigma2.unsqueeze(0) + ZDZ
+        return null, V0, self._chol_group_cov(V0)
+
+    def _random_effect_score(self, idx, L_V0):
+        X_eff = self.masked_X
+        y_eff = self.masked_y.unsqueeze(-1)
+        Z_q   = self.masked_Z[:, :, idx]
+
+        ViX = torch.cholesky_solve(X_eff, L_V0)
+        Viy = torch.cholesky_solve(y_eff, L_V0)
+        ViZ = torch.cholesky_solve(Z_q,   L_V0)
+        XtViX = torch.einsum('gip,giq->pq', X_eff, ViX)
+        XtViy = torch.einsum('gip,gio->po', X_eff, Viy)
+        XtViZ = torch.einsum('gip,gik->pk', X_eff, ViZ)
+
+        beta0 = torch.linalg.solve(XtViX, XtViy)
+        w     = Viy - ViX @ beta0
+        Zqw   = torch.einsum('gik,gio->k', Z_q, w)
+        S_plus = 0.5 * (Zqw ** 2).sum()
+
+        P0Z  = ViZ - ViX @ torch.linalg.solve(XtViX, XtViZ)
+        W    = torch.einsum('gik,gil->kl', Z_q, P0Z)
+        e    = 0.5 * torch.diagonal(W).sum()
+        info = 0.5 * (W ** 2).sum()
+        return S_plus, e, info
+
+    @staticmethod
+    def _random_effect_pvalue(S_plus, e, info):
+        from scipy import stats
+        Sp, e, I = float(S_plus), float(e), float(info)
+        a = I / (2.0 * max(e, 1e-12))
+        b = 2.0 * e ** 2 / max(I, 1e-12)
+        return {"statistic": Sp, "scale_a": a, "df": b,
+                "p_value": float(stats.chi2.sf(Sp / max(a, 1e-12), b))}
+
+    def random_effect_test(self, q=None, alpha=0.05, null_fit_kwargs=None):
+        """q=None tests every random effect; q=int tests one; q=list[int] tests
+        that block jointly. Returns a dict (or list of dicts) with re_idx,
+        statistic, df, scale_a, p_value, reject."""
+        if q is None:
+            return [self.random_effect_test(j, alpha=alpha, null_fit_kwargs=null_fit_kwargs)
+                    for j in range(self.pz)]
+        idx = [q] if isinstance(q, int) else list(q)
+        _, _, L_V0 = self._random_effect_null_cov(idx, null_fit_kwargs=null_fit_kwargs)
+        S_plus, e, info = self._random_effect_score(idx, L_V0)
+        out = self._random_effect_pvalue(S_plus, e, info)
+        out.update(re_idx=idx if len(idx) > 1 else idx[0], reject=bool(out["p_value"] < alpha))
+        return out
 
     def AIC(self):
         """AIC from the ML log-likelihood at the fitted estimates (use an ML fit for a proper AIC)."""

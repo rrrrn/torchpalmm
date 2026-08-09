@@ -85,10 +85,17 @@ class SmoothingSplineMixed(SmoothingSpline):
         self.obs_id = obs_id
 
         X_fit = self.X; NB_list = []; B_list = []; self.spline_linear_col_idx = []
+        self.spline_linear_center = []
         for i in range(self.spline_inputs.shape[1]):
             sp = self.spline_inputs[:, i]
             NB, B, input_tilde, _, group_indices = self.prepare_design_matrix(sp, torch.unique(sp), obs_id)
             NB_list.append(NB); B_list.append(B)
+
+            # Center the slope column; stacked trends are badly conditioned otherwise.
+            slope_mean = input_tilde[:, 1].mean()
+            self.spline_linear_center.append(slope_mean)
+            input_tilde = input_tilde.clone()
+            input_tilde[:, 1] = input_tilde[:, 1] - slope_mean
 
             if i == 0:
                 X_fit = torch.hstack((X_fit, input_tilde))
@@ -175,7 +182,6 @@ class SmoothingSplineMixed(SmoothingSpline):
         else:
             self.rho = 0.0
         return self.lmm
-    import torch
 
     def grouped_nb_to_NxK(self, NB_grouped):
         ## NB_grouped: G x nmax x K tensor
@@ -250,10 +256,11 @@ class SmoothingSplineMixed(SmoothingSpline):
             Xeval  = torch.sort(self.unique_spline_vec[c].to(device))[0]
             smooth = self.B_list[c].to(device).to(f64) @ a_c
             slope_idx = self.spline_linear_col_idx[c]
+            center_c  = self.spline_linear_center[c].to(device=device, dtype=f64)
             if c == 0:
-                linear = self.beta[int(slope_idx)] * Xeval + self.beta[self.px].squeeze()
+                linear = self.beta[int(slope_idx)] * (Xeval - center_c) + self.beta[self.px].squeeze()
             else:
-                linear = self.beta[slope_idx] * Xeval
+                linear = self.beta[slope_idx] * (Xeval - center_c)
             theta_fitted = linear + smooth
             fitted_list.append(pd.DataFrame({
                 "spline_id": c,
@@ -277,6 +284,68 @@ class SmoothingSplineMixed(SmoothingSpline):
             self.rand_effects = None
 
         return self.fitted_df, self.rand_effects
+
+    def smooth_confint(self, alpha=0.05, col_smooth=None, z=None):
+        """Pointwise confidence band for each smooth, conditional on the REML variance
+        components (mgcv's default). Refs: Wahba (1983); Nychka (1988)."""
+        if not hasattr(self, "beta"):
+            raise ValueError("Model not fitted yet.")
+        from scipy.stats import norm
+        device, f64 = self.device, torch.float64
+        z = float(norm.ppf(1.0 - alpha / 2.0)) if z is None else z
+
+        lmm      = self.lmm
+        G, nm    = lmm.n_groups, lmm.nmax
+        Ktot, p  = lmm.K_tot, self.X_fit.shape[1]
+        mask_vec = lmm.mask.unsqueeze(-1)
+        mask_mat = mask_vec @ mask_vec.transpose(1, 2)
+
+        ZDZ  = (lmm.masked_Z @ self.D @ lmm.masked_Z.transpose(-1, -2)).to(f64)
+        V0   = (self.sigma2 * lmm.resid_corr().unsqueeze(0) + ZDZ) * mask_mat \
+               + (1.0 - mask_mat) * lmm.eye_nmax * 1e6
+        L_V0 = torch.linalg.cholesky(0.5 * (V0 + V0.transpose(-1, -2)))
+
+        X   = (lmm.X_grouped * mask_vec).to(f64)
+        U   = lmm.U_grouped.to(f64)
+        ViX = torch.cholesky_solve(X, L_V0).reshape(G * nm, p)
+        ViU = torch.cholesky_solve(U, L_V0).reshape(G * nm, Ktot)
+        Xm, Um = X.reshape(G * nm, p), U.reshape(G * nm, Ktot)
+
+        lam = torch.repeat_interleave(self.tau_sq_list.to(f64), lmm._K_repeats)
+        H   = torch.zeros(p + Ktot, p + Ktot, dtype=f64, device=device)
+        H[:p, :p] = Xm.T @ ViX
+        H[p:, :p] = Um.T @ ViX
+        H[:p, p:] = H[p:, :p].T
+        H[p:, p:] = Um.T @ ViU + torch.diag(1.0 / lam)
+        L_H = torch.linalg.cholesky(0.5 * (H + H.T)
+                                    + 1e-10 * torch.eye(p + Ktot, dtype=f64, device=device))
+
+        self.get_blup(col_smooth=col_smooth, random_effects=False)
+        fdf = self.fitted_df
+
+        offsets = [0]
+        for k in lmm.K_list:
+            offsets.append(offsets[-1] + k)
+        colset = [col_smooth] if col_smooth is not None else range(self.spline_inputs.shape[1])
+
+        out = []
+        for c in colset:
+            Xeval = torch.sort(self.unique_spline_vec[c].to(device))[0].to(f64)
+            E = torch.zeros(Xeval.numel(), p + Ktot, dtype=f64, device=device)
+            E[:, int(self.spline_linear_col_idx[c])] = \
+                Xeval - self.spline_linear_center[c].to(device=device, dtype=f64)
+            if c == 0:
+                E[:, self.px] = 1.0
+            E[:, p + offsets[c]: p + offsets[c + 1]] = self.B_list[c].to(device).to(f64)
+            var = (E * torch.cholesky_solve(E.T, L_H).T).sum(1).clamp(min=0.0)
+            se  = torch.sqrt(var).detach().cpu().numpy()
+            sub = fdf[fdf["spline_id"] == c].copy()
+            sub["se"]    = se
+            sub["lower"] = sub["theta_fitted"] - z * se
+            sub["upper"] = sub["theta_fitted"] + z * se
+            out.append(sub)
+        self.confint_df = pd.concat(out, ignore_index=True)
+        return self.confint_df
 
     def fixed_t_test(self, l=None, alpha=0.05, fixed_only=True):
         """Satterthwaite t-test for fixed effects, delegated to the fitted self.lmm.

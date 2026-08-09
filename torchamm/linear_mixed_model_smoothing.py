@@ -143,7 +143,6 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         puts tr(D_param) ≈ 0.08 while the true tr ≈ 128 — the sample init is ~1600×
         closer and dramatically shortens the optimizer's journey.
         """
-        # dtype = self.y_.dtype
         r_, r_g = self._ols_residuals()
         n_obs = self.mask.sum().item()
         sigma2_ols = ((r_ ** 2).sum() / max(n_obs - self.X_.shape[1], 1)).clamp(min=1e-6)
@@ -280,10 +279,9 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         M   = 0.5 * (M + M.transpose(0, 1))
         L_M = torch.linalg.cholesky(M + 1e-10 * torch.eye(Ktot, device=self.device, dtype=f64))
         logdetM = 2.0 * torch.sum(torch.log(torch.diagonal(L_M)))
-        logdetV = logdetB + torch.sum(torch.log(lam)) + logdetM
-
         Minv_UX = torch.cholesky_solve(A_UX, L_M)
         Minv_Uy = torch.cholesky_solve(A_Uy, L_M)
+        logdetV = logdetB + torch.sum(torch.log(lam)) + logdetM
         XtVinvX = A_XX - A_UX.transpose(0, 1) @ Minv_UX
         XtVinvy = A_Xy - A_UX.transpose(0, 1) @ Minv_Uy
         ytVinvy = A_yy - (A_Uy.transpose(0, 1) @ Minv_Uy).squeeze()
@@ -424,13 +422,17 @@ class LinearMixedModelSmoothing(LinearMixedModel):
     def fit_likelihood(self, optimizer=torch.optim.Adam, lr=1e-3, max_iter=1000, fit_type="REML",
                        tol=1e-6, warm_start=True, verbose=False, convg_check="loss",
                        max_iter_inner=10, tau_lr_mult=5.0, group_chunk=None, grad_control_tol=1e-2,
-                       corr_init_method="moment"):
+                       corr_init_method="moment", plateau_patience=5):
         """
         tau_lr_mult      : lr multiplier for spline_params vs D_params in Adam.
         group_chunk      : process groups in chunks; reduces peak memory at 2x Cholesky cost.
         corr_init_method : "fixed" (rho_raw=0, current default) or "moment" (data-driven
                            init via within-group OLS-residual correlations; avoids the
                            rho→1 / sigma2→large spurious local minimum for large pz).
+        plateau_patience : (LBFGS, convg_check="loss") also converge once rel_loss < tol
+                           holds for this many consecutive epochs, regardless of grad_norm.
+                           Catches the case where the loss has genuinely converged but
+                           gradient noise keeps grad_norm from ever clearing grad_control_tol.
         """
         beta, sigma2 = self.reset_params(OLS=warm_start, estimate=self.rand_D_estimate,
                                          corr_init_method=corr_init_method)
@@ -530,6 +532,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
 
             convg = 0
             epoch = 0
+            plateau = 0
             for epoch in range(max_iter_outer):
                 total_loss = opt_joint.step(closure_joint)
 
@@ -567,7 +570,8 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                     print(f"LBFGS: Epoch {epoch}, loss = {current_loss:.6f}, grad_norm = {grad_norm:.3e}, rel_loss = {rel_loss:.6f}, rel_param = {rel_param:.6f}")
 
                 if convg_check == "loss":
-                    if rel_loss < tol and grad_norm < grad_control_tol:
+                    plateau = plateau + 1 if rel_loss < tol else 0
+                    if (rel_loss < tol and grad_norm < grad_control_tol) or plateau >= plateau_patience:
                         convg = 1
                 elif convg_check == "all":
                     if rel_loss < tol and rel_param < tol:

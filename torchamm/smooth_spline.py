@@ -39,9 +39,6 @@ class SmoothingSpline:
     def construct_Omega(x):
         Q = SmoothingSpline.construct_Q(x)
         R = SmoothingSpline.construct_R(x)
-
-        # Omega = Q @ torch.linalg.solve(R, Q.T)
-
         return Q, R
     
     @staticmethod
@@ -112,7 +109,6 @@ class SmoothingSpline:
                 X_fit = torch.hstack((X_fit, input_tilde[:, 1:]))  # x only
             self.spline_linear_col_idx.append(X_fit.shape[1] - 1)
         self.NB_list = NB_list; self.B_list = B_list
-        ## remove repeatedly added ones in X_fit
         self.X_fit = X_fit.to(device=self.device)
         
     def fit(self, warm_start=True, lr=1e-3, max_iter=1000, optimizer=torch.optim.Adam, 
@@ -129,11 +125,10 @@ class SmoothingSpline:
             self.lmm.fit_likelihood(lr=lr, max_iter=max_iter, tol = tol, verbose=verbose, optimizer=optimizer, fit_type=fit_type,warm_start=warm_start,
                                     max_iter_inner=max_iter_inner, convg_check=convg_check)
         else:
-            return NotImplementedError("Smoothing spline allow only one spline variable for now. Multiple spline variables will be implemented in the future.")
-            
+            raise NotImplementedError("Smoothing spline allow only one spline variable for now. Multiple spline variables will be implemented in the future.")
+
         self.sigma2 = self.lmm.sigma2.detach()
         self.beta = self.lmm.beta.detach()
-        # self.Dz = self.lmm.Dz.detach()
         self.D = self.lmm.D.detach()
         self.tau_sq_list = [torch.unique(torch.diagonal(self.lmm.D)).detach()]
         return self.lmm 
