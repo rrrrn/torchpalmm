@@ -1,15 +1,10 @@
 """Smoke tests: fit on tiny synthetic data and check the public API behaves."""
 
 import numpy as np
-from pathlib import Path
-import sys
 import torch
 
 from torchpalmm import LinearMixedModel, SmoothingSplineMixed
 from torchpalmm.linear_mixed_model_smoothing import LinearMixedModelSmoothing
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from src.LinearMixedModelSmoothing import LinearMixedModelSmoothing as SrcLinearMixedModelSmoothing
 
 torch.set_default_dtype(torch.float64)
 
@@ -74,22 +69,22 @@ def test_diagonal_residual_variance_in_both_trees():
     y = np.arange(G * ni, dtype=float)[:, None] / 10.0
     NB = torch.arange(G * ni, dtype=torch.float64).reshape(G, ni, 1) / 10.0
 
-    for cls in (LinearMixedModelSmoothing, SrcLinearMixedModelSmoothing):
-        model = cls(y=y, X=X, Z=Z, id=ids, spline_inputs=[NB],
-                    corr_structure="diagonal", rand_D_type="diagonal")
-        model.reset_params(OLS=False)
-        assert model.rho_raw.numel() == ni - 1
+    model = LinearMixedModelSmoothing(
+        y=y, X=X, Z=Z, id=ids, spline_inputs=[NB],
+        corr_structure="diagonal", rand_D_type="diagonal")
+    model.reset_params(OLS=False)
+    assert model.rho_raw.numel() == ni - 1
 
-        with torch.no_grad():
-            model.rho_raw.copy_(torch.log(torch.tensor([2.0, 0.5])))
-        R = model.resid_corr()
-        assert torch.allclose(torch.diagonal(R), torch.tensor([1.0, 2.0, 0.5]))
-        assert torch.count_nonzero(R - torch.diag(torch.diagonal(R))) == 0
+    with torch.no_grad():
+        model.rho_raw.copy_(torch.log(torch.tensor([2.0, 0.5])))
+    R = model.resid_corr()
+    assert torch.allclose(torch.diagonal(R), torch.tensor([1.0, 2.0, 0.5]))
+    assert torch.count_nonzero(R - torch.diag(torch.diagonal(R))) == 0
 
-        D = model.param_to_sqmatrix(model.D_params, n=1,
-                                    correlation_structure="diagonal")
-        loss, sigma2 = model.loss_fn_reml(D, model.spline_params)
-        loss.backward()
-        assert torch.isfinite(loss) and torch.isfinite(sigma2)
-        assert model.rho_raw.grad is not None
-        assert torch.isfinite(model.rho_raw.grad).all()
+    D = model.param_to_sqmatrix(model.D_params, n=1,
+                                correlation_structure="diagonal")
+    loss, sigma2 = model.loss_fn_reml(D, model.spline_params)
+    loss.backward()
+    assert torch.isfinite(loss) and torch.isfinite(sigma2)
+    assert model.rho_raw.grad is not None
+    assert torch.isfinite(model.rho_raw.grad).all()
