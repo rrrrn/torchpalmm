@@ -6,6 +6,39 @@ def _checktensor(x):
     return x
 
 class LinearMixedModel:
+    # Raw correlation parameters are held in [-RHO_RAW_MAX, RHO_RAW_MAX]. At the bound the
+    # implied rho is already 0.99995, whereas past |raw| ~ 19 the links saturate to exactly
+    # +-1 in float64: V goes singular and drho/draw underflows to 0, so the optimizer can
+    # never come back. _project_params puts the parameter back after every step.
+    RHO_RAW_MAX = 10.0
+
+    # structures whose sigma_L[1] is a raw correlation parameter, not a scale
+    _CORR_PARAM_STRUCTURES = ("compoundsymmetry", "cs", "ar1", "autoregressive",
+                              "exponential", "exp")
+
+    @staticmethod
+    def cs_rho_lower(n):
+        """Lower end of the admissible compound-symmetry correlation range for an n-block."""
+        return -1.0 / (n - 1) if n > 1 else 0.0
+
+    @classmethod
+    def cs_rho(cls, raw, n):
+        """raw -> rho over the full admissible CS range (-1/(n-1), 1)."""
+        lo = cls.cs_rho_lower(n)
+        return lo + (1.0 - lo) * torch.sigmoid(raw.clamp(-cls.RHO_RAW_MAX, cls.RHO_RAW_MAX))
+
+    @classmethod
+    def cs_rho_inverse(cls, rho, n):
+        """Inverse of cs_rho."""
+        lo = cls.cs_rho_lower(n)
+        u = ((rho - lo) / (1.0 - lo)).clamp(1e-6, 1.0 - 1e-6)
+        return torch.log(u / (1.0 - u)).clamp(-cls.RHO_RAW_MAX, cls.RHO_RAW_MAX)
+
+    @staticmethod
+    def _lag(n, device, dtype):
+        idx = torch.arange(n, device=device, dtype=dtype)
+        return (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()
+
     @staticmethod
     def construct_lower_triangular_matrix(elements, n):
         sigma_L = torch.zeros((n, n), device=elements.device, dtype=elements.dtype)
@@ -17,7 +50,6 @@ class LinearMixedModel:
         correlation_structure = self.corr_structure
         nmax = max(self.lengths_)
         if correlation_structure is None or correlation_structure.lower() in ["unstructured", "full", "unspecified"]:
-            ## lower triangular matrix
             if elements is not None and elements.shape[0] == (nmax * (nmax + 1)) // 2:
                 sigma_L = elements
             else:
@@ -58,9 +90,9 @@ class LinearMixedModel:
     
     @staticmethod
     def ols_matrix_elements(elements, correlation, nmax):
-        ## elements: a scalar
+        # elements: a scalar
         if correlation is None or correlation.lower() in ["unstructured", "full", "unspecified"]:
-            ## element be the lower triangular matrix elements: scalar to vector of length nmax*(nmax+1)/2
+            # scalar -> lower-triangular elements of length nmax*(nmax+1)/2
             L = torch.eye(nmax, device=elements.device) * elements
             L_lower_elements = L[torch.tril_indices(row=nmax, col=nmax, offset=0)[0], torch.tril_indices(row=nmax, col=nmax, offset=0)[1]]
             return L_lower_elements
@@ -69,9 +101,10 @@ class LinearMixedModel:
         elif correlation.lower() in ["independent", "diagonal"]:
             return elements * torch.ones(nmax, device=elements.device, dtype=elements.dtype)
         elif correlation.lower() in ["compoundsymmetry", "cs"]:
-            # param[0]=sqrt(0.75)*σ (private), param[1]=0.5*σ (shared) → rho_init≈0.25, sigma2_init=σ².
-            return torch.tensor([0.75**0.5 * elements, 0.5 * elements],
-                                device=elements.device, dtype=elements.dtype)
+            # param[0] = sigma, param[1] = raw with rho = cs_rho(raw, nmax); start at rho = 0.25.
+            raw = LinearMixedModel.cs_rho_inverse(
+                torch.tensor(0.25, device=elements.device, dtype=elements.dtype), nmax)
+            return torch.stack([elements.reshape(()), raw.reshape(())])
         elif correlation.lower() in ["ar1", "autoregressive"]:
             rho = 0
             return torch.tensor([elements, rho], device=elements.device, dtype=elements.dtype)
@@ -85,23 +118,30 @@ class LinearMixedModel:
         if len(param)==0:
                 return torch.zeros((n, n), device=param.device, dtype=self.y_.dtype)
         if correlation_structure is None or correlation_structure.lower() in ["unstructured", "full", "unspecified"]:
-            L = self.construct_lower_triangular_matrix(param, n) ## lower triangular matrix
+            L = self.construct_lower_triangular_matrix(param, n)
             D = (L @ L.T).to(device=param.device, dtype=self.y_.dtype)
         elif correlation_structure.lower() in ["iid", "identity"]:
-            return (param**2) * self.eye_nmax[:n, :n].to(device=param.device, dtype=self.y_.dtype)
+            D = (param**2) * torch.eye(n, device=param.device, dtype=self.y_.dtype)
         elif correlation_structure.lower() in ["independent", "diagonal"]:
             D =  torch.diag(param**2).to(device=param.device, dtype=self.y_.dtype)
         elif correlation_structure.lower() in ["compoundsymmetry", "cs"]:
-            # param[0]²·I (private) + param[1]²·J (shared): always PSD, rho=param[1]²/(param[0]²+param[1]²).
-            D = param[0]**2 * torch.eye(n, device=param.device, dtype=self.y_.dtype) + param[1]**2 * torch.ones((n, n), device=param.device, dtype=self.y_.dtype)
+            # sigma2 = param[0]^2, rho = cs_rho(param[1], n) over the full admissible range;
+            # a*I + b*J with a,b >= 0 could only reach rho >= 0.
+            rho = self.cs_rho(param[1], n).to(device=param.device, dtype=self.y_.dtype)
+            eye = torch.eye(n, device=param.device, dtype=self.y_.dtype)
+            J = torch.ones((n, n), device=param.device, dtype=self.y_.dtype)
+            D = param[0]**2 * ((1.0 - rho) * eye + rho * J)
         elif correlation_structure.lower() in ["ar1", "autoregressive"]:
-            rho = torch.tanh(param[1])
-            indices = torch.arange(n, device=param.device)
-            D =  param[0]**2 * rho**torch.abs(indices.unsqueeze(0) - indices.unsqueeze(1)).to(device=param.device, dtype=self.y_.dtype)
+            rho = torch.tanh(param[1].clamp(-self.RHO_RAW_MAX, self.RHO_RAW_MAX))
+            lag = self._lag(n, param.device, self.y_.dtype)
+            # integer exponent: exact for rho<0, and unlike |rho|^lag * sign(rho) it keeps
+            # the right derivative at rho=0, which is where the OLS warm start begins.
+            D = param[0]**2 * rho ** lag.long()
         elif correlation_structure.lower() in ['exponential', 'exp']:
-            phi = torch.exp(param[1])
-            indices = torch.arange(n, device=param.device)
-            D =  param[0]**2 * torch.exp(-phi * torch.abs(indices.unsqueeze(0) - indices.unsqueeze(1))).to(device=param.device, dtype=self.y_.dtype)
+            # softplus, not exp: exp(param) overflows to inf and -inf*0 makes the diagonal NaN.
+            phi = torch.nn.functional.softplus(param[1].clamp(-self.RHO_RAW_MAX, self.RHO_RAW_MAX))
+            lag = self._lag(n, param.device, self.y_.dtype)
+            D = param[0]**2 * torch.exp(-phi * lag)
         else:
             raise ValueError("Unsupported correlation structure.")
         diag_idx = torch.arange(n, device=param.device)
@@ -112,7 +152,7 @@ class LinearMixedModel:
     def initialize_rand_D(self, pz, type = "unstructured", estimate = "sample"):
         if type == "unstructured":
             if estimate == "sample":
-                ## use sample covariance of Z as initial value
+                # init from the sample second moment of Z
                 D_hat = torch.zeros((pz, pz), device=self.device, dtype=self.y_.dtype)
                 total_count = 0
                 for i, l in enumerate(self.lengths_):
@@ -137,9 +177,9 @@ class LinearMixedModel:
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = device
-        self.y_ = _checktensor(y).to(self.device).view(-1, 1) ## N x 1 tensor
-        self.X_ = _checktensor(X).to(self.device)## N x px tensor
-        self.Z_ = _checktensor(Z).to(self.device)## N x pz tensor
+        self.y_ = _checktensor(y).to(self.device).view(-1, 1)  # N x 1
+        self.X_ = _checktensor(X).to(self.device)              # N x px
+        self.Z_ = _checktensor(Z).to(self.device)              # N x pz
         self.id_ = torch.as_tensor(id, device=self.device).view(-1)
         unique_ids = torch.unique(self.id_)
         self._group_idx = [(self.id_ == uid).nonzero(as_tuple=True)[0] for uid in unique_ids]
@@ -150,7 +190,6 @@ class LinearMixedModel:
         px = self.X_.shape[1]
         pz = self.Z_.shape[1]
 
-        # Allocate padded arrays
         self.X_grouped = torch.zeros((self.n_groups, self.nmax, px), device=self.device, dtype=self.X_.dtype)
         self.Z_grouped = torch.zeros((self.n_groups, self.nmax, pz), device=self.device, dtype=self.Z_.dtype)
         self.y_grouped = torch.zeros((self.n_groups, self.nmax), device=self.device, dtype=self.y_.dtype)
@@ -159,7 +198,6 @@ class LinearMixedModel:
         self.rand_D_type = rand_D_type
         self.rand_D_estimate = rand_D_estimate
 
-        # Fill with per-group samples
         start = 0
         for i, l in enumerate(self.lengths_):
             end = start + l
@@ -168,7 +206,6 @@ class LinearMixedModel:
             self.y_grouped[i, :l] = self.y_[ start:end ].squeeze()
             start = end
 
-        # Build mask
         self.mask = torch.zeros((self.n_groups, self.nmax), device=self.device)
         for i, l in enumerate(self.lengths_):
             self.mask[i, :l] = 1.0
@@ -189,8 +226,7 @@ class LinearMixedModel:
         
     @staticmethod
     def stablize_tensor(X, eps=1e-6):
-        ## check for cholesky stability
-        ## X is either 2D square or 3D batch of square matrices
+        # ridge for Cholesky stability
         if X.dim() == 3 and X.shape[1] == X.shape[2]:
             eye = torch.eye(X.size(-1), device=X.device, dtype=X.dtype).unsqueeze(0)
             return X + eps * eye
@@ -224,32 +260,41 @@ class LinearMixedModel:
         else:
             return False
     
+    def _has_resid_corr_param(self):
+        """True when sigma_L[1] is a raw correlation parameter rather than a scale."""
+        cs = self.corr_structure
+        return cs is not None and cs.lower() in self._CORR_PARAM_STRUCTURES
+
+    def _project_params(self):
+        """Put raw correlation parameters back into the range where the link has gradient."""
+        if self._has_resid_corr_param():
+            with torch.no_grad():
+                self.sigma_L.data[1].clamp_(-self.RHO_RAW_MAX, self.RHO_RAW_MAX)
+
     def beta_hat(self, sigma2, D):
         device = self.y_grouped.device
         G = self.n_groups
 
         if self.mask.dim() == 2:
-            mask_vec = self.mask.unsqueeze(-1)     # [G, nmax, 1]
+            mask_vec = self.mask.unsqueeze(-1)
         else:
-            mask_vec = self.mask                   # [G, nmax, 1]
+            mask_vec = self.mask
 
-        # masked X and y
         X_eff = self.X_grouped * mask_vec.to(dtype=self.X_grouped.dtype)        # [G, nmax, px]
         y_eff = self.y_grouped * mask_vec.squeeze(-1).to(dtype=self.y_grouped.dtype)  # [G, nmax]
-        # build V_i
         if self.corr_structure == "iid" and self.rand_D_type == "iid":
             if sigma2.ndim == 2 and sigma2.shape[0] == self.nmax:
-                sigma2 = torch.diagonal(sigma2, dim1=-2, dim2=-1).mean(dim=-1) # scalar
+                sigma2 = torch.diagonal(sigma2, dim1=-2, dim2=-1).mean(dim=-1)
             if D.ndim == 2 and D.shape[0] == self.Z_.shape[1]:
-                tau2 = torch.diagonal(D, dim1=-2, dim2=-1).mean(dim=-1) # scalar
+                tau2 = torch.diagonal(D, dim1=-2, dim2=-1).mean(dim=-1)
 
             Z = self.masked_Z * mask_vec
-            ZtZ = Z.transpose(-1,-2) @ Z # pz x pz
+            ZtZ = Z.transpose(-1,-2) @ Z  # [G, pz, pz]
             eps = 1e-5
             
             diag_mean = torch.mean(torch.diagonal(ZtZ, dim1=-2, dim2=-1), dim=-1)
             jitter = eps * ((1.0 / tau2) + (1.0 / sigma2) * diag_mean)
-            jitter = jitter.unsqueeze(-1).unsqueeze(-1) # scalar to be added to each element of M for stability
+            jitter = jitter.unsqueeze(-1).unsqueeze(-1)
             
             I_q = torch.eye(self.pz, device=ZtZ.device, dtype=ZtZ.dtype)
             sigma2 = sigma2.to(device=ZtZ.device, dtype=ZtZ.dtype)
@@ -258,8 +303,8 @@ class LinearMixedModel:
             tau2   = tau2.clamp_min(1e-8)
 
             M = (1.0/tau2)[..., None, None] * I_q + (1.0/sigma2)[..., None, None] * ZtZ
-            L_M = torch.linalg.cholesky(M) ## pz x pz
-            Zt_y = Z.transpose(-1,-2) @ self.masked_y.unsqueeze(-1) # pz x 1
+            L_M = torch.linalg.cholesky(M)  # [G, pz, pz]
+            Zt_y = Z.transpose(-1,-2) @ self.masked_y.unsqueeze(-1)  # [G, pz, 1]
             tmp = torch.cholesky_solve(Zt_y, L_M)
 
             Vinv_y = (1.0/sigma2)*self.masked_y.unsqueeze(-1) - (1.0/sigma2**2)*(Z @ tmp)
@@ -304,19 +349,19 @@ class LinearMixedModel:
     def reset_params(self, OLS=False, estimate="sample"):
         if OLS & (len(self.X_) > 0) and estimate == "sample":
             beta = torch.linalg.lstsq(self.X_, self.y_).solution.clone()
-            # ols of sigma2
             residuals = self.y_ - self.X_ @ beta
-            sigma2 = (residuals.T @ residuals) / (len(self.y_) - self.X_.shape[1]) ## scalar
+            sigma2 = (residuals.T @ residuals) / (len(self.y_) - self.X_.shape[1])
             self.sigma_L = self.ols_matrix_elements(torch.sqrt(sigma2).squeeze(), self.corr_structure, self.nmax)
             self.sigma_L = torch.nn.Parameter(self.sigma_L)
         else:
-            if self.corr_structure is None or self.corr_structure.lower() in ["unstructured", "full", "unspecified"]:
-                self.sigma_L = torch.ones((self.nmax * (self.nmax + 1)) // 2, requires_grad=True, device=self.device)
-            elif self.corr_structure.lower() in ["iid", "identity"]:
-                self.sigma_L = torch.ones(1, requires_grad=True, device=self.device)
-            elif self.corr_structure.lower() in ["independent", "diagonal"]:
-                self.sigma_L = torch.ones(self.nmax, requires_grad=True, device=self.device)
-            beta = torch.ones((self.X_.shape[1], 1), device=self.device)
+            # _n_resid_params covers every structure, including cs/ar1/exp which the old
+            # chain skipped entirely, leaving sigma_L unset.
+            sigma_L = torch.ones(self._n_resid_params(), device=self.device, dtype=self.y_.dtype)
+            if self._has_resid_corr_param():
+                sigma_L[1] = 0.0          # neutral starting correlation, not a scale of 1
+            self.sigma_L = torch.nn.Parameter(sigma_L)
+            beta = torch.ones((self.X_.shape[1], 1), device=self.device, dtype=self.y_.dtype)
+            sigma2 = torch.ones((1, 1), device=self.device, dtype=self.y_.dtype)
         
         self.initialize_correlation(elements=self.sigma_L)
         self.initialize_rand_D(pz=self.Z_.shape[1], type=self.rand_D_type, estimate=self.rand_D_estimate)
@@ -329,9 +374,7 @@ class LinearMixedModel:
         if beta is None:
             beta = self.beta_
 
-        ## id: N x 1 tensor indicating individual ids
-        ## D: pz x pz tensor
-        ## sigma2: ni x ni tensor
+        # sigma2: nmax x nmax residual covariance; D: pz x pz
         logdetVsum = torch.tensor(0.0, dtype=self.y_.dtype, device=self.y_.device)
         rVinvr = torch.tensor(0.0, dtype=self.y_.dtype, device=self.y_.device)
 
@@ -340,7 +383,6 @@ class LinearMixedModel:
         mask_mat = self.mask.unsqueeze(-1) * self.mask.unsqueeze(-2)  # [G, nmax, nmax]
         V_full = Sigma + ZDZ
 
-        # [G, nmax, nmax]
         mask_mat = self.mask.unsqueeze(-1) * self.mask.unsqueeze(-2)  # [G, nmax, nmax]
         Vi = V_full * mask_mat + (1 - mask_mat) * self.eye_nmax * 1e6
 
@@ -352,7 +394,7 @@ class LinearMixedModel:
         Vinv_e = torch.cholesky_solve(e_exp, LVi)  # [G, nmax, 1]
 
         rVinvr = torch.sum(e_exp.squeeze(-1) * Vinv_e.squeeze(-1), dim=1)  # [G]
-        rVinvr = torch.sum(rVinvr)  # scalar
+        rVinvr = torch.sum(rVinvr)
 
         logdetVi = 2 * torch.sum(torch.log(torch.diagonal(LVi, dim1=1, dim2=2)), dim=1)  # [G]
         logdetVsum = torch.sum(logdetVi)
@@ -373,31 +415,29 @@ class LinearMixedModel:
 
         if self.corr_structure == "iid" and self.rand_D_type == "iid":
             if sigma2.ndim == 2 and sigma2.shape[0] == self.nmax:
-                sigma2 = torch.diagonal(sigma2, dim1=-2, dim2=-1).mean(dim=-1) # scalar
+                sigma2 = torch.diagonal(sigma2, dim1=-2, dim2=-1).mean(dim=-1)
             if D.ndim == 2 and D.shape[0] == self.Z_.shape[1]:
-                tau2 = torch.diagonal(D, dim1=-2, dim2=-1).mean(dim=-1) # scalar
+                tau2 = torch.diagonal(D, dim1=-2, dim2=-1).mean(dim=-1)
 
             Z = self.masked_Z * mask_vec
-            ZtZ = Z.transpose(-1,-2) @ Z # pz x pz
+            ZtZ = Z.transpose(-1,-2) @ Z  # [G, pz, pz]
             eps = 1e-5
 
-            ## apply transformation to improve cholesky stability
+            # jitter for Cholesky stability
             diag_mean = torch.mean(torch.diagonal(ZtZ, dim1=-2, dim2=-1), dim=-1)
             jitter = eps * ((1.0 / tau2) + (1.0 / sigma2) * diag_mean)
             jitter = jitter.unsqueeze(-1).unsqueeze(-1)
 
-            # ZtZ: [G, pz, pz]
             I_q = torch.eye(self.pz, device=ZtZ.device, dtype=ZtZ.dtype)
             sigma2 = sigma2.to(device=ZtZ.device, dtype=ZtZ.dtype)
             tau2   = tau2.to(device=ZtZ.device, dtype=ZtZ.dtype)
             sigma2 = sigma2.clamp_min(1e-8)
             tau2   = tau2.clamp_min(1e-8)
 
-            # broadcast for batching if needed
             M = (1.0/tau2)[..., None, None] * I_q + (1.0/sigma2)[..., None, None] * ZtZ
 
-            L_M = torch.linalg.cholesky(M) ## pz x pz
-            Zt_y = Z.transpose(-1,-2) @ self.masked_y.unsqueeze(-1) # pz x 1
+            L_M = torch.linalg.cholesky(M)  # [G, pz, pz]
+            Zt_y = Z.transpose(-1,-2) @ self.masked_y.unsqueeze(-1)  # [G, pz, 1]
             tmp = torch.cholesky_solve(Zt_y, L_M)
 
             Vinv_y = (1.0/sigma2)*self.masked_y.unsqueeze(-1) - (1.0/sigma2**2)*(Z @ tmp)
@@ -420,8 +460,8 @@ class LinearMixedModel:
             logdetV_sum = logdetV.sum() if logdetV.ndim > 0 else logdetV
 
         else:
-            Sigma = sigma2.unsqueeze(0).expand(G, -1, -1).to( device=device) ## [G, nmax, nmax]
-            ZDZ   = torch.matmul(self.masked_Z @ D, self.masked_Z.transpose(-1, -2)) ## [G, nmax, nmax]
+            Sigma = sigma2.unsqueeze(0).expand(G, -1, -1).to( device=device)  # [G, nmax, nmax]
+            ZDZ   = torch.matmul(self.masked_Z @ D, self.masked_Z.transpose(-1, -2))  # [G, nmax, nmax]
             V_full = Sigma + ZDZ
 
             V = V_full * mask_mat + (1.0 - mask_mat) * self.eye_nmax * 1e6  # [G, nmax, nmax]
@@ -460,8 +500,8 @@ class LinearMixedModel:
         total_loss = loss_function(sigma2=sigma2, D=D)
         total_loss.backward()
         opt.step()
+        self._project_params()
 
-        ## check convergence
         with torch.no_grad():
             D = self.param_to_sqmatrix(self.L_elements, n=self.pz, correlation_structure=self.rand_D_type)
             sigma2 = self.param_to_sqmatrix(self.sigma_L, n=max(self.lengths_), correlation_structure=self.corr_structure)
@@ -469,11 +509,9 @@ class LinearMixedModel:
             current_sigma2 = sigma2
 
             if fit_type.lower() == "ml":
-                pass
+                beta_ = self.beta_.detach()   # ML optimizes beta directly
             else:
-                beta_ = self.beta_hat(
-                sigma2=sigma2, D=D
-            )
+                beta_ = self.beta_hat(sigma2=sigma2, D=D)
                 
             beta_change = torch.max(torch.abs((beta_ - prev_beta)/prev_beta)).item()
             eps = 1e-8
@@ -484,22 +522,18 @@ class LinearMixedModel:
             rel_change = abs((current_loss - prev_loss) / (prev_loss + 1e-12))
 
         if current_loss > prev_loss:
-            ## halve the learning rate if loss increases
             for param_group in opt.param_groups:
                 param_group['lr'] = param_group['lr'] * 0.5
 
         convg_criteria = 0
         if convg_check == "loss":
             if rel_change < tol:
-                # print(f"Converged at step {step}, loss = {current_loss:.6f}")
                 convg_criteria = 1
         elif convg_check == "all":
             if (rel_change < tol) and (beta_change < tol) and (D_change < tol) and (sigma2_change < tol):
-                # print(f"Converged at step {step}, loss = {current_loss:.6f}")
                 convg_criteria = 1
         elif convg_check == "params":
             if (beta_change < tol) and (D_change < tol) and (sigma2_change < tol):
-                # print(f"Converged at step {step}, loss = {current_loss:.6f}")
                 convg_criteria = 1
         else:
             raise ValueError("Invalid convergence check method.")
@@ -515,7 +549,6 @@ class LinearMixedModel:
         if verbose:
             print("OLS beta:", beta.T)
 
-        ## check if shape of y, X, Z agrees
         if not (len(self.y_) == len(self.X_) == len(self.Z_)):
             raise ValueError("Incompatible shapes: y, X, and Z must have the same length.")
         
@@ -524,7 +557,6 @@ class LinearMixedModel:
         else:
             loss_function = self.loss_fn_reml
 
-        ## set up optimizer and optimization loop
         if verbose:
             print(f"Using standard optimizer: {optimizer.__name__}")
         if fit_type.lower() == "ml":
@@ -544,6 +576,7 @@ class LinearMixedModel:
         if verbose:
             print("Starting optimization...")
 
+        convg = 0
         for step in range(max_iter):
             convg_criteria, current_loss, current_sigma2, current_D,  current_beta, rel_change, beta_change, D_change, sigma2_change = self.update_iter(
                 loss_function, opt, fit_type, tol, convg_check, prev_beta, prev_D, prev_sigma2, prev_loss
@@ -605,8 +638,9 @@ class LinearMixedModel:
                 return loss
 
             convg = 0
-            for epoch in range(max_iter_outer):      # now max_iter means "outer epochs"
+            for epoch in range(max_iter_outer):
                 total_loss = opt.step(closure)
+                self._project_params()
                 loss_check = total_loss.detach()
                 grad_norm = 0.0
                 for p in opt.param_groups[0]['params']:
@@ -650,6 +684,10 @@ class LinearMixedModel:
                 warnings.warn(f"LinearMixedModel: LBFGS did not converge in {max_iter_outer} epochs "
                               f"(rel_loss={rel_loss:.2e}, grad_norm={grad_norm:.2e}).")
 
+        if fit_type.lower() != "ml" and optimizer != torch.optim.LBFGS:
+            # The Adam REML path profiles beta out analytically; expose the last value.
+            self.beta_ = current_beta
+
         self.final_loss = current_loss
         self.convg = convg
         self.sigma2 = current_sigma2.clone().detach()
@@ -659,9 +697,7 @@ class LinearMixedModel:
         return self
     
     
-    ##########################################
-    ### Hypothesis testing for fixed effects
-    ##########################################
+    # --- Hypothesis testing for fixed effects ---
     # Satterthwaite t-test (lmerTest): t = l'b / sqrt(l'C l),
     # nu = 2 f^2 / (grad_f' A grad_f) with f(theta)=l'C(theta)l,
     # theta the variance params, A = [d2 nll/d theta2]^-1.
@@ -762,9 +798,7 @@ class LinearMixedModel:
             l_vec = torch.as_tensor(l, device=self.device, dtype=self.y_.dtype).reshape(px, 1)
         return self._contrast_test(l_vec, theta_hat, A)
 
-    ##########################################
-    ### Hypothesis testing for random effects
-    ##########################################
+    # --- Hypothesis testing for random effects ---
     # Boundary score test (Lin 1997; Zhang & Lin 2003): U = S+ - e at H0,
     # S+ = 1/2 ||Z_idx' P0 y||^2, matched to a scaled chi-square a*chi2_b.
     # See docs/linearity_test.md.
@@ -864,9 +898,7 @@ class LinearMixedModel:
         return 2.0 * nll_value.item() + 2.0 * k
 
 
-##########################################
-### LRT for model selection
-##########################################
+# --- LRT for model selection ---
 def lrt_test(lmm1, lmm2, boundary=False):
     """Likelihood-ratio test between two fitted models on the same data.
 

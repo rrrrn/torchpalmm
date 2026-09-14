@@ -5,13 +5,11 @@ import torch.nn.functional as F
 class SmoothingSpline:
     @staticmethod
     def construct_Q(x):
-        ## make sure x is a 1D torch tensor
         x = x.flatten()
         n = x.shape[0]
         h = x[1:] - x[:-1]  
 
         Q = torch.zeros((n, n-2), dtype=x.dtype, device=x.device)
-        ## diagonals
         cols = torch.arange(n-2)
         Q[cols, cols] = 1.0 / h[cols]
         Q[cols + 1, cols] = -1.0 / h[cols] - 1.0 / h[cols + 1]
@@ -26,10 +24,8 @@ class SmoothingSpline:
 
         R = torch.zeros((n-2, n-2), dtype=x.dtype, device=x.device)
 
-        # Diagonal: (1/3)*(h_j + h_{j+1})
         cols = torch.arange(n-2)
         R[cols, cols] = (h[cols] + h[cols + 1]) / 3.0
-        # Off-diagonals: 1/6 * h_{j}
         cols = torch.arange(n-3)
         R[cols + 1, cols] = h[cols+1] / 6.0
         R[cols, cols + 1] = h[cols+1] / 6.0
@@ -61,22 +57,20 @@ class SmoothingSpline:
         unique_vec = torch.sort(unique_vec, descending=False)[0]
         Q, R = SmoothingSpline.construct_Omega(unique_vec)
 
-        ## cholesky of R inverse
         C = torch.linalg.cholesky(R)
         I = torch.eye(R.shape[0], dtype=R.dtype, device=R.device)
         S = torch.linalg.solve(C, I)  # C^{-1}
-        L = Q @ S ## n x n-2
+        L = Q @ S  # n x n-2
 
-        ## incidence matrix
         Nmtx = SmoothingSpline.construct_incidence_matrix(original_vec, unique_vec)
 
-        ## random effect design matrix for smoothing splines
+        # random-effect design for the spline
         LtL = L.T @ L
         chol = torch.linalg.cholesky(LtL + 1e-10*torch.eye(LtL.shape[0], device=L.device, dtype=L.dtype))
         B = torch.cholesky_solve(L.T, chol).T 
         NB = Nmtx @ B
 
-        ## input = [1, time] as a torch tensor
+        # [1, x] parametric part
         input_tilde = torch.stack((torch.ones_like(original_vec), original_vec), dim=1)
         input_tilde_unique = torch.stack((torch.ones_like(unique_vec), unique_vec), dim=1)
         return NB, B, input_tilde, input_tilde_unique
@@ -91,7 +85,7 @@ class SmoothingSpline:
 
         self.X = _checktensor(X); self.y = _checktensor(y).to(device=self.device); self.Z = _checktensor(Z).to(device=self.device)
         self.pz = Z.shape[1]; self.px = X.shape[1]
-        self.spline_inputs = _checktensor(spline_inputs).to(device=self.device) ## a matrix of size n x p (p spline variables)
+        self.spline_inputs = _checktensor(spline_inputs).to(device=self.device)  # n x p
         if len(self.spline_inputs.shape) == 1:
             self.spline_inputs = self.spline_inputs.unsqueeze(1)
         self.unique_spline_vec = [torch.unique(self.spline_inputs[:, i]) for i in range(self.spline_inputs.shape[1])]
@@ -106,7 +100,7 @@ class SmoothingSpline:
             if i == 0:
                 X_fit = torch.hstack((X_fit, input_tilde))  
             else:
-                X_fit = torch.hstack((X_fit, input_tilde[:, 1:]))  # x only
+                X_fit = torch.hstack((X_fit, input_tilde[:, 1:]))  # drop the duplicate intercept
             self.spline_linear_col_idx.append(X_fit.shape[1] - 1)
         self.NB_list = NB_list; self.B_list = B_list
         self.X_fit = X_fit.to(device=self.device)
@@ -116,7 +110,7 @@ class SmoothingSpline:
              verbose =True):
         
         if self.pz==0:
-            ## only one group
+            # single group
             id = torch.ones(self.y.shape[0], dtype=torch.long, device=self.device)
             self.lmm = LinearMixedModel(
                 y = self.y, X = self.X_fit, Z = self.NB_list[0], id = id, corr_structure=self.corr_structure, device=self.device,
@@ -134,7 +128,6 @@ class SmoothingSpline:
         return self.lmm 
     
     def get_fitted_theta(self, col = 0):
-        ## make sure the model is already fitted
         if not hasattr(self, 'beta'):
             raise ValueError("Model not fitted yet. Please call the fit() method first.")
         

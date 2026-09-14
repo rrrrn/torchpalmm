@@ -1,5 +1,5 @@
 [project]
-name = "torchamm"
+name = "torchpalmm"
 description = "Scalable REML for additive smooth (penalized-spline) mixed models on PyTorch."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -34,20 +34,20 @@ examples = ["matplotlib", "jupyter"]
 test = ["pytest"]
 
 [project.urls]
-Homepage = "https://github.com/rrrrn/torchamm"
-Repository = "https://github.com/rrrrn/torchamm"
-Issues = "https://github.com/rrrrn/torchamm/issues"
+Homepage = "https://github.com/rrrrn/torchpalmm"
+Repository = "https://github.com/rrrrn/torchpalmm"
+Issues = "https://github.com/rrrrn/torchpalmm/issues"
 
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.dynamic]
-version = { attr = "torchamm.__version__" }
+version = { attr = "torchpalmm.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["torchamm*"]
+include = ["torchpalmm*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

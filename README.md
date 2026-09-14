@@ -1,4 +1,4 @@
-# torchamm
+# torchpalmm
 
 Scalable **REML** estimation for linear mixed models with multiple **additive smooth
 (penalized smoothing-spline) components**, implemented in PyTorch. Computation is batched
@@ -11,17 +11,17 @@ smooth component (H0: the curve is linear).
 **From GitHub, without cloning:**
 
 ```bash
-pip install git+https://github.com/rrrrn/torchamm.git
+pip install git+https://github.com/rrrrn/torchpalmm.git
 
 # with the example deps (matplotlib/jupyter for the vignette):
-pip install "torchamm[examples] @ git+https://github.com/rrrrn/torchamm.git"
+pip install "torchpalmm[examples] @ git+https://github.com/rrrrn/torchpalmm.git"
 ```
 
 **From a local clone (editable, for development):**
 
 ```bash
-git clone https://github.com/rrrrn/torchamm.git
-cd torchamm
+git clone https://github.com/rrrrn/torchpalmm.git
+cd torchpalmm
 pip install -e .                 # core
 pip install -e ".[examples,test]"   # + matplotlib/jupyter + pytest
 ```
@@ -30,7 +30,7 @@ pip install -e ".[examples,test]"   # + matplotlib/jupyter + pytest
 
 ```python
 import torch, numpy as np
-from torchamm import LinearMixedModel, SmoothingSplineMixed
+from torchpalmm import LinearMixedModel, SmoothingSplineMixed
 
 # --- linear mixed model: y = X beta + Z b + eps ---
 m = LinearMixedModel(y=y, X=X, Z=Z, id=subject_id,
@@ -76,7 +76,7 @@ For the methodology (model, scalable REML, the linearity score test), see:
 
 ## Citation
 
-If you use `torchamm`, please cite: **TODO**
+If you use `torchpalmm`, please cite: **TODO**
 
 ```bibtex
 ```

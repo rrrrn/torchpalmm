@@ -8,9 +8,7 @@ from tqdm import tqdm
 class SmoothingSplineMixed(SmoothingSpline):
     @staticmethod
     def construct_incidence_matrix(origin_vec, unique_vec, ids):
-        ## id: grouping variable
-        ## output: N x n x m tensor
-
+        # returns (incidence [G, nmax, m], group indices)
         device = origin_vec.device
         dtype = torch.float64
 
@@ -38,16 +36,14 @@ class SmoothingSplineMixed(SmoothingSpline):
         unique_vec = torch.sort(unique_vec, descending=False)[0]
         Q, R = SmoothingSplineMixed.construct_Omega(unique_vec)
 
-        ## cholesky of R inverse
         C = torch.linalg.cholesky(R)
         I = torch.eye(R.shape[0], dtype=R.dtype, device=R.device)
         S = torch.linalg.solve(C, I)  # C^{-1}
-        L = Q @ S ## m x m-2
+        L = Q @ S  # m x m-2
 
-        ## incidence matrix: N x n x m tensor
         Nmtx, group_indices = SmoothingSplineMixed.construct_incidence_matrix(original_vec, unique_vec, ids)
 
-        ## random effect design matrix for smoothing splines
+        # random-effect design for the spline
         LtL = L.T @ L
         I_m2 = torch.eye(LtL.shape[0], device=L.device, dtype=L.dtype)
         jitter = 1e-10
@@ -57,9 +53,9 @@ class SmoothingSplineMixed(SmoothingSpline):
                 break
             jitter *= 10.0
         B = torch.cholesky_solve(L.T, chol).T  # m x m-2
-        NB = Nmtx @ B # N x n x m-2
+        NB = Nmtx @ B  # [G, nmax, m-2]
 
-        ## input = [1, time] as a torch tensor
+        # [1, x] parametric part
         input_tilde = torch.stack((torch.ones_like(original_vec), original_vec), dim=1)
         input_tilde_unique = torch.stack((torch.ones_like(unique_vec), unique_vec), dim=1)
         return NB, B, input_tilde, input_tilde_unique, group_indices
@@ -151,9 +147,8 @@ class SmoothingSplineMixed(SmoothingSpline):
 
             best = _save()
             for k in range(1, n_restarts):
-                # Random log-τ² init: U(-2, 4) covers τ² from ~0.1 to ~55.
-                # Random rho_raw init: U(-3, 3) covers rho from ~0.05 to ~0.95,
-                # breaking the rho-saturation trap (rho→1, sigma2→large).
+                # log-τ² ~ U(-2, 4) covers τ² from ~0.1 to ~55; rho_raw ~ U(-3, 3)
+                # covers rho ~0.05 to ~0.95, breaking the rho→1 saturation trap.
                 self.lmm.reset_params(OLS=False)
                 with torch.no_grad():
                     self.lmm.spline_params.data.uniform_(-2.0, 4.0)
@@ -173,6 +168,8 @@ class SmoothingSplineMixed(SmoothingSpline):
             _restore(best)
 
         self.sigma2 = self.lmm.sigma2.detach()
+        self.resid_cov = self.sigma2 * self.lmm.resid_corr().detach()
+        self.lmm.resid_cov = self.resid_cov
         self.beta = self.lmm.beta.detach()
         self.D = self.lmm.D.detach()
         self.tau_sq_list = self.lmm.tuning_params.detach()
@@ -184,8 +181,7 @@ class SmoothingSplineMixed(SmoothingSpline):
         return self.lmm
 
     def grouped_nb_to_NxK(self, NB_grouped):
-        ## NB_grouped: G x nmax x K tensor
-        ## output: N x K tensor where N is total number of observations
+        # [G, nmax, K] -> [N, K]
         N = self.obs_id.shape[0]
         K = NB_grouped.shape[2]
 

@@ -1,4 +1,4 @@
-"""torchamm -- scalable REML for additive smooth mixed models on PyTorch."""
+"""torchpalmm -- scalable REML for additive smooth mixed models on PyTorch."""
 
 __version__ = "0.1.0"
 

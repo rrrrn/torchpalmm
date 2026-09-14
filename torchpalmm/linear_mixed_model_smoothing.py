@@ -15,11 +15,11 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = device
-        self.y_ = _checktensor(y).to(self.device).view(-1, 1) ## N x 1 tensor
-        self.X_ = _checktensor(X).to(self.device)## N x px tensor
-        self.Z_ = _checktensor(Z).to(self.device)## N x pz tensor
+        self.y_ = _checktensor(y).to(self.device).view(-1, 1)  # N x 1
+        self.X_ = _checktensor(X).to(self.device)              # N x px
+        self.Z_ = _checktensor(Z).to(self.device)              # N x pz
         self.NB_list = [_checktensor(spline).to(self.device) for spline in spline_inputs] 
-        self.len_spline = len(self.NB_list) ## S
+        self.len_spline = len(self.NB_list)  # S
 
         self.id_ = torch.as_tensor(id, device=self.device).view(-1)
         unique_ids = torch.unique(self.id_)
@@ -32,7 +32,6 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         self.rank_X = torch.linalg.matrix_rank(self.X_)
         pz = self.Z_.shape[1]
 
-        # Allocate padded arrays
         self.X_grouped = torch.zeros((self.n_groups, self.nmax, px), device=self.device, dtype=self.X_.dtype)
         self.Z_grouped = torch.zeros((self.n_groups, self.nmax, pz), device=self.device, dtype=self.Z_.dtype)
         self.y_grouped = torch.zeros((self.n_groups, self.nmax), device=self.device, dtype=self.y_.dtype)
@@ -40,14 +39,12 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         self.rand_D_type = rand_D_type
         self.rand_D_estimate = rand_D_estimate
 
-        # Fill with per-group samples
         for i, idx in enumerate(self._group_idx):
             l = idx.numel()
             self.X_grouped[i, :l] = self.X_[idx]
             self.Z_grouped[i, :l] = self.Z_[idx]
             self.y_grouped[i, :l] = self.y_[idx].squeeze()
 
-        # Build mask
         self.mask = torch.zeros((self.n_groups, self.nmax), device=self.device)
         for i, l in enumerate(self.lengths_):
             self.mask[i, :l] = 1.0
@@ -60,8 +57,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         self.eye_nmax = torch.eye(self.nmax, device=self.device, dtype=self.y_grouped.dtype)
         self.pz = pz
 
-        # NB_list[s] has shape [G, nmax, K_s]; K_s may differ across splines.
-        # Compute NB @ NB.T per spline — result is [G, nmax, nmax] regardless of K_s.
+        # NB_list[s] is [G, nmax, K_s] with K_s varying; NB @ NB.T is [G, nmax, nmax] either way.
         mask_3d = self.mask.unsqueeze(-1)                   # [G, nmax, 1]
         self.NB_NB = torch.stack([
             (NB * mask_3d) @ (NB * mask_3d).transpose(-1, -2)
@@ -76,10 +72,11 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         self.U_grouped = torch.cat([NB * mask_3d for NB in self.NB_list],
                                    dim=2)                   # [G, nmax, K_tot]
     
-    # Aliases mirror LinearMixedModel; all map to a unit-diagonal relative
-    # correlation since σ² is profiled out of the REML objective.
+    # Relative residual structures. Diagonal uses an identified variance-ratio
+    # representation because the common residual scale σ² is profiled out.
     _CORR_ALIASES = {
         "iid": "iid", "identity": "iid",
+        "independent": "diag", "diagonal": "diag",
         "compoundsymmetry": "cs", "cs": "cs", "compound_symmetry": "cs",
         "ar1": "ar1", "autoregressive": "ar1",
         "exponential": "exp", "exp": "exp",
@@ -94,7 +91,13 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         return self._CORR_ALIASES[k]
 
     def _has_corr_params(self):
-        return self._corr_kind() in ("cs", "ar1", "exp")
+        kind = self._corr_kind()
+        return kind in ("cs", "ar1", "exp") or (kind == "diag" and self.nmax > 1)
+
+    def _project_params(self):
+        if self._has_corr_params():
+            with torch.no_grad():
+                self.rho_raw.data.clamp_(-self.RHO_RAW_MAX, self.RHO_RAW_MAX)
 
     def _lag_matrix(self):
         idx = torch.arange(self.nmax, device=self.device, dtype=self.y_.dtype)
@@ -105,19 +108,30 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         return self._resid_corr_from_raw(getattr(self, "rho_raw", None))
 
     def _resid_corr_from_raw(self, rho_raw):
-        """R built from a given rho_raw (lets hypothesis testing differentiate through ρ)."""
+        """Relative residual covariance R built from its unconstrained parameters."""
         kind = self._corr_kind()
         if kind == "iid":
             return self.eye_nmax
+        if kind == "diag":
+            # The profiled scalar sigma² is the first-position residual variance;
+            # nmax-1 log-variance ratios identify the remaining diagonal entries.
+            if self.nmax == 1:
+                return self.eye_nmax
+            log_var = torch.cat((rho_raw.new_zeros(1), rho_raw.reshape(-1)))
+            return torch.diag(torch.exp(log_var.clamp(-self.RHO_RAW_MAX,
+                                                       self.RHO_RAW_MAX)))
+        rho_raw = rho_raw.clamp(-self.RHO_RAW_MAX, self.RHO_RAW_MAX)
         if kind == "cs":
-            rho = torch.sigmoid(rho_raw)
+            # full admissible range (-1/(nmax-1), 1); a plain sigmoid reaches only rho > 0
+            rho = self.cs_rho(rho_raw, self.nmax)
             J = torch.ones((self.nmax, self.nmax), device=self.device, dtype=self.y_.dtype)
             return rho * J + (1.0 - rho) * self.eye_nmax
         lag = self._lag_matrix()
         if kind == "ar1":
             rho = torch.tanh(rho_raw)                       # (-1, 1); AR1 is PD throughout
-            sign = torch.where((lag.long() % 2 == 1), torch.sign(rho), torch.ones_like(rho))
-            return rho.abs().pow(lag) * sign               # rho^|i-j|, sign-safe for ρ<0
+            # integer exponent: exact for rho<0, and unlike |rho|^lag * sign(rho) it keeps
+            # the right derivative at rho=0, which is the "fixed" init.
+            return rho ** lag.long()
         # exponential: R[i,j] = exp(-φ|i-j|), φ>0 (AR1 with ρ=exp(-φ)∈(0,1))
         phi = torch.nn.functional.softplus(rho_raw)
         return torch.exp(-phi * lag)
@@ -137,11 +151,9 @@ class LinearMixedModelSmoothing(LinearMixedModel):
     def _sample_D_init(self):
         """Method-of-moments estimate of D_param = D_true / sigma2 from OLS residuals.
 
-        E[Z_i^T r_i r_i^T Z_i / n_i] ≈ D_true + sigma2 * Z_i^T Z_i / n_i, so
-        dividing the group-averaged outer product by sigma2_ols gives a noisy but
-        well-scaled estimate of D_true / sigma2.  For pz=8 the current 0.1*I init
-        puts tr(D_param) ≈ 0.08 while the true tr ≈ 128 — the sample init is ~1600×
-        closer and dramatically shortens the optimizer's journey.
+        E[Z_i^T r_i r_i^T Z_i / n_i] ≈ D_true + sigma2 * Z_i^T Z_i / n_i, so dividing
+        the group-averaged outer product by sigma2_ols gives a noisy but well-scaled
+        start, orders of magnitude closer than a flat 0.1*I init at large pz.
         """
         r_, r_g = self._ols_residuals()
         n_obs = self.mask.sum().item()
@@ -151,7 +163,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         # ZTr[g, :] = Z_g^T r_g  (batched over groups)
         ZTr = (self.masked_Z.transpose(-1, -2) @
                r_g.unsqueeze(-1)).squeeze(-1)                # [G, pz]
-        ZTr_scaled = ZTr / n_i.clamp(min=1).sqrt().unsqueeze(-1)  # divide by sqrt(n_i)
+        ZTr_scaled = ZTr / n_i.clamp(min=1).sqrt().unsqueeze(-1)
         D_acc = ZTr_scaled.T @ ZTr_scaled                   # [pz, pz]
         D_raw = D_acc / (self.n_groups * sigma2_ols)         # approx D_true / sigma2
 
@@ -166,7 +178,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         For compound symmetry, E[r_j r_k] / E[r_j^2] within groups (j≠k) equals
         sigma2*rho / (sigma2 + tr(D)), which is attenuated by the random-effects
         variance but always in (0, rho_true).  Starting rho_raw below the true
-        value is far safer than starting at 0.5 (= rho_raw 0), which tends to
+        value is far safer than starting at rho_raw = 0, which tends to
         drift into the spurious rho→1 local minimum for large pz.
         """
         dtype = self.y_.dtype
@@ -184,7 +196,21 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         mean_cross = ((sum_r ** 2 - sum_r2)[n_i > 1]).sum() / n_pairs
         mean_sq    = sum_r2.sum() / n_obs
         rho_mom    = (mean_cross / (mean_sq + 1e-12)).clamp(0.005, 0.95)
-        return torch.log(rho_mom / (1.0 - rho_mom)).reshape(1)  # logit → rho_raw
+        return self._rho_raw_from_rho(rho_mom).reshape(1)
+
+    def _rho_raw_from_rho(self, rho):
+        """Invert the link used by _resid_corr_from_raw so a target rho starts the optimizer
+        at that rho under every structure. A shared logit is right only for cs:
+        tanh(logit(p)) flips sign for p < 0.5, and softplus(logit(p)) gives 1-p."""
+        kind = self._corr_kind()
+        if kind == "cs":
+            raw = self.cs_rho_inverse(rho, self.nmax)
+        elif kind == "ar1":
+            raw = torch.atanh(rho.clamp(-0.999, 0.999))
+        else:                                       # exp: rho = exp(-softplus(raw))
+            phi = -torch.log(rho.clamp(1e-6, 1.0 - 1e-6))
+            raw = torch.log(torch.expm1(phi))       # inverse softplus
+        return raw.clamp(-self.RHO_RAW_MAX, self.RHO_RAW_MAX)
 
     def initialize_rand_D(self, type="unstructured", estimate="sample",
                           corr_init_method="moment"):
@@ -198,7 +224,10 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         self.spline_params = torch.nn.Parameter(rho_init)  # log(τ²) per component
 
         if self._has_corr_params():
-            if corr_init_method == "moment":
+            if self._corr_kind() == "diag":
+                rho_raw_init = torch.zeros(self.nmax - 1, device=self.device,
+                                           dtype=self.y_.dtype)
+            elif corr_init_method == "moment":
                 rho_raw_init = self._moment_rho_init()
             else:
                 rho_raw_init = torch.zeros(1, device=self.device, dtype=self.y_.dtype)
@@ -265,7 +294,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         Biy = torch.cholesky_solve(y_eff.unsqueeze(-1), L)
         BiU = torch.cholesky_solve(U_all, L)
 
-        # Σ_g per-group quadratic forms via one matmul over stacked [G*nm, ·].
+        # Per-group quadratic forms via one matmul over stacked [G*nm, .].
         Xm, ym, Um    = X_eff.reshape(G * nm, p), y_eff.reshape(G * nm, 1), U_all.reshape(G * nm, Ktot)
         BiXm, Biym, BiUm = BiX.reshape(G * nm, p), Biy.reshape(G * nm, 1), BiU.reshape(G * nm, Ktot)
         A_XX = Xm.transpose(0, 1) @ BiXm
@@ -322,14 +351,12 @@ class LinearMixedModelSmoothing(LinearMixedModel):
     def beta_hat(self, D, spline_param=None):
 
         if self.mask.dim() == 2:
-            mask_vec = self.mask.unsqueeze(-1)     # [G, nmax, 1]
+            mask_vec = self.mask.unsqueeze(-1)
         else:
-            mask_vec = self.mask                   # [G, nmax, 1]
+            mask_vec = self.mask
 
-        # masked X and y
         X_eff = self.X_grouped * mask_vec.to(dtype=self.X_grouped.dtype)        # [G, nmax, px]
         y_eff = self.y_grouped * mask_vec.squeeze(-1).to(dtype=self.y_grouped.dtype)  # [G, nmax]
-        # build V_i
 
         ZDZ   = torch.matmul(self.masked_Z @ D, self.masked_Z.transpose(-1, -2))
         I = torch.eye(self.nmax, device=self.device, dtype=torch.float64)
@@ -349,7 +376,6 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                 Vi = Vi + jitter * I
                 break
             jitter *= 10.0
-        # LVi = torch.linalg.cholesky(Vi)  # [G, nmax, nmax]
 
         Vinv_X = torch.cholesky_solve(X_eff, LVi)                # [G, nmax, px]
         Vinv_y = torch.cholesky_solve(y_eff.unsqueeze(-1), LVi)  # [G, nmax, 1]
@@ -378,13 +404,14 @@ class LinearMixedModelSmoothing(LinearMixedModel):
             if p.grad is not None
         ) ** 0.5
         opt.step()
+        self._project_params()
 
         with torch.no_grad():
             D = self.param_to_sqmatrix(self.D_params, n=self.pz, correlation_structure=self.rand_D_type)
             current_spline_param = torch.exp(self.spline_params)
             current_D = D
 
-            # Reuse cache from forward pass — no second Cholesky needed.
+            # Reuse the forward-pass cache; no second Cholesky needed.
             beta_  = self._beta_cache
             sigma2 = self._sigma2_cache
 
@@ -426,7 +453,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         """
         tau_lr_mult      : lr multiplier for spline_params vs D_params in Adam.
         group_chunk      : process groups in chunks; reduces peak memory at 2x Cholesky cost.
-        corr_init_method : "fixed" (rho_raw=0, current default) or "moment" (data-driven
+        corr_init_method : "fixed" (rho_raw=0) or "moment" (default; data-driven
                            init via within-group OLS-residual correlations; avoids the
                            rho→1 / sigma2→large spurious local minimum for large pz).
         plateau_patience : (LBFGS, convg_check="loss") also converge once rel_loss < tol
@@ -445,7 +472,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         if not (len(self.y_) == len(self.X_) == len(self.Z_)):
             raise ValueError("Incompatible shapes: y, X, and Z must have the same length.")
 
-        loss_function = self.loss_fn_reml  # always REML here; ML path unchanged
+        loss_function = self.loss_fn_reml
 
         prev_beta         = beta.clone().detach()
         D                 = self.param_to_sqmatrix(self.D_params, n=self.pz, correlation_structure=self.rand_D_type)
@@ -454,7 +481,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         prev_sigma2       = sigma2.clone().detach()
         prev_loss         = float("inf")
 
-        # ── Adam path ─────────────────────────────────────────────────────────
+        # Adam path
         if optimizer != torch.optim.LBFGS:
             if verbose:
                 print(f"Using {optimizer.__name__} with tau_lr_mult={tau_lr_mult}")
@@ -493,14 +520,14 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                 if step % 10 == 0 and verbose:
                     print(f"Step {step}, loss = {current_loss:.6f}, rel_change = {rel_change:.6f}")
 
-            # Adam REML path profiles out beta analytically — expose the cached value.
+            # The Adam REML path profiles beta out analytically; expose the cached value.
             self.beta_ = current_beta
 
             if convg == 0:
                 warnings.warn("LinearMixedModelSmoothing: Adam did not converge in "
                               f"{max_iter} steps.")
 
-        # ── LBFGS path ────────────────────────────────────────────────────────
+        # LBFGS path
         else:
             if max_iter_inner is None:
                 max_iter_inner = 10
@@ -508,9 +535,8 @@ class LinearMixedModelSmoothing(LinearMixedModel):
             if verbose:
                 print(f"LBFGS: {max_iter_outer} outer epochs, {max_iter_inner} inner steps, tau_lr_mult={tau_lr_mult}")
 
-            # Joint LBFGS over D_params + spline_params simultaneously.
-            # Both parameters see second-order curvature; τ gets the same optimization
-            # effort as D rather than just 1 Adam step per outer epoch.
+            # Joint LBFGS over D_params + spline_params: τ sees the same second-order
+            # curvature as D, not just 1 Adam step per outer epoch.
             lbfgs_params = []
             if len(self.D_params) > 0:
                 lbfgs_params.append(self.D_params)
@@ -535,6 +561,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
             plateau = 0
             for epoch in range(max_iter_outer):
                 total_loss = opt_joint.step(closure_joint)
+                self._project_params()
 
                 loss_check = total_loss.detach()
 
@@ -597,15 +624,14 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         self.final_loss   = current_loss
         self.convg        = convg
         self.sigma2       = current_sigma2.clone().detach()
+        self.resid_cov    = self.sigma2 * self.resid_corr().detach()
         self.beta         = self.beta_.clone().detach()
         self.D            = current_D.clone().detach() * self.sigma2
         self.tuning_params = current_spline_param.clone().detach() * self.sigma2
         self.n_iter       = (epoch + 1) * max_iter_inner if optimizer == torch.optim.LBFGS else step
         return self
 
-    ##########################################
-    ### Fixed-effect hypothesis testing (Satterthwaite; σ² profiled, in θ as log σ²)
-    ##########################################
+    # --- Fixed-effect hypothesis testing (Satterthwaite; σ² profiled, in θ as log σ²) ---
     # Reuses the inherited fixed_t_test / _contrast_test / f_theta; only the
     # parametrization hooks below are smoothing-specific. theta stacks
     # [D_params, spline_params, (rho_raw), log σ²]; C = σ²(X'V⁻¹X)⁻¹ in relative units.
@@ -647,13 +673,11 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         XtVinvX = XtVinvX + 1e-10 * torch.eye(p, device=XtVinvX.device, dtype=XtVinvX.dtype)
         return torch.exp(log_s2) * torch.linalg.inv(XtVinvX)
 
-    ##########################################
-    ### Linearity test for a smooth component (variance-component score test)
-    ##########################################
+    # --- Linearity test for a smooth component (variance-component score test) ---
     # H0: tau_c^2 = 0 (component c is linear) vs H1: tau_c^2 > 0 (nonlinear).
-    # Boundary score test (Lin 1997; Zhang & Lin 2003) computed in closed form in
-    # the natural tau^2 scale -- the internal log(tau^2) score is identically zero
-    # at the boundary. Only the null fit is needed. See docs/linearity_test.md.
+    # Boundary score test (Lin 1997; Zhang & Lin 2003), in closed form in the natural
+    # tau^2 scale: the internal log(tau^2) score is identically zero at the boundary.
+    # Only the null fit is needed. See docs/linearity_test.md.
 
     def _chol_group_cov(self, V):
         """Mask padded rows and return a jittered per-group Cholesky of V [G, nm, nm]."""
