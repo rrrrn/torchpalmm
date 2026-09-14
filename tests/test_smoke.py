@@ -72,8 +72,10 @@ def test_diagonal_residual_variance_in_both_trees():
     model = LinearMixedModelSmoothing(
         y=y, X=X, Z=Z, id=ids, spline_inputs=[NB],
         corr_structure="diagonal", rand_D_type="diagonal")
+    expected_init = model._diagonal_rho_init()
     model.reset_params(OLS=False)
     assert model.rho_raw.numel() == ni - 1
+    assert torch.allclose(model.rho_raw, expected_init)
 
     with torch.no_grad():
         model.rho_raw.copy_(torch.log(torch.tensor([2.0, 0.5])))

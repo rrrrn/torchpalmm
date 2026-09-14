@@ -198,6 +198,22 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         rho_mom    = (mean_cross / (mean_sq + 1e-12)).clamp(0.005, 0.95)
         return self._rho_raw_from_rho(rho_mom).reshape(1)
 
+    def _diagonal_rho_init(self):
+        """Initialize diagonal residual variance ratios from pooled OLS residuals.
+
+        The diagonal residual structure is indexed by within-subject position.  The
+        common profiled scale is fixed by the first position, so only the log ratios
+        of the remaining position-wise mean squared residuals are returned.
+        """
+        dtype = self.y_.dtype
+        _, r_g = self._ols_residuals()
+        mask = self.mask.to(dtype=dtype)
+        counts = mask.sum(dim=0).clamp_min(1.0)
+        var_by_position = (r_g.pow(2) * mask).sum(dim=0) / counts
+        var_by_position = var_by_position.clamp_min(1e-8)
+        ratios = var_by_position[1:] / var_by_position[0]
+        return torch.log(ratios).clamp(-self.RHO_RAW_MAX, self.RHO_RAW_MAX)
+
     def _rho_raw_from_rho(self, rho):
         """Invert the link used by _resid_corr_from_raw so a target rho starts the optimizer
         at that rho under every structure. A shared logit is right only for cs:
@@ -225,8 +241,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
 
         if self._has_corr_params():
             if self._corr_kind() == "diag":
-                rho_raw_init = torch.zeros(self.nmax - 1, device=self.device,
-                                           dtype=self.y_.dtype)
+                rho_raw_init = self._diagonal_rho_init()
             elif corr_init_method == "moment":
                 rho_raw_init = self._moment_rho_init()
             else:
