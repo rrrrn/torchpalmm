@@ -92,3 +92,28 @@ def test_diagonal_residual_variance_in_both_trees():
     assert torch.isfinite(loss) and torch.isfinite(sigma2)
     assert model.rho_raw.grad is not None
     assert torch.isfinite(model.rho_raw.grad).all()
+
+
+def test_spline_variance_gradient_below_old_floor():
+    """torch.clamp zeroes gradients outside its range; a min=0.0 forward clamp on
+    log(tau^2) previously trapped spline_params at tau^2=1 once it dropped below 0."""
+    G, ni = 4, 3
+    ids = np.repeat(np.arange(G), ni)
+    X = np.ones((G * ni, 1))
+    Z = np.ones((G * ni, 1))
+    y = np.arange(G * ni, dtype=float)[:, None] / 10.0
+    NB = torch.arange(G * ni, dtype=torch.float64).reshape(G, ni, 1) / 10.0
+
+    model = LinearMixedModelSmoothing(
+        y=y, X=X, Z=Z, id=ids, spline_inputs=[NB],
+        corr_structure="iid", rand_D_type="diagonal")
+    model.reset_params(OLS=False)
+
+    with torch.no_grad():
+        model.spline_params.copy_(torch.tensor([-5.0], dtype=model.spline_params.dtype))
+
+    D = model.param_to_sqmatrix(model.D_params, n=1, correlation_structure="diagonal")
+    loss, _ = model.loss_fn_reml(D, model.spline_params)
+    loss.backward()
+    assert torch.isfinite(model.spline_params.grad).all()
+    assert model.spline_params.grad.abs().item() > 0

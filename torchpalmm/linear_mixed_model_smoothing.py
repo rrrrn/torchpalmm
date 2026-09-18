@@ -298,7 +298,8 @@ class LinearMixedModelSmoothing(LinearMixedModel):
 
         ZDZ     = torch.matmul(self.masked_Z @ D, self.masked_Z.transpose(-1, -2)).to(f64)
         R       = R.to(f64)
-        tau_sq  = torch.exp(spline_param.clamp(min=0.0, max=20.0))   # [S]
+        # symmetric bound is exp() overflow safety only; a min>0 would trap the gradient at 0.
+        tau_sq  = torch.exp(spline_param.clamp(min=-20.0, max=20.0))   # [S]
         lam     = torch.repeat_interleave(tau_sq, self._K_repeats)   # [Ktot]
         lam_inv = 1.0 / lam
 
