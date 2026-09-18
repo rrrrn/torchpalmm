@@ -61,7 +61,7 @@ def test_smoothing_spline_mixed():
 
 
 def test_diagonal_residual_variance_in_both_trees():
-    """Diagonal residuals use one reference variance and nmax-1 log ratios."""
+    """Diagonal residuals use nmax centered log-variances; sigma2 is their geometric mean."""
     G, ni = 4, 3
     ids = np.repeat(np.arange(G), ni)
     X = np.ones((G * ni, 1))
@@ -74,13 +74,15 @@ def test_diagonal_residual_variance_in_both_trees():
         corr_structure="diagonal", rand_D_type="diagonal")
     expected_init = model._diagonal_rho_init()
     model.reset_params(OLS=False)
-    assert model.rho_raw.numel() == ni - 1
+    assert model.rho_raw.numel() == ni
     assert torch.allclose(model.rho_raw, expected_init)
 
+    raw = torch.log(torch.tensor([1.0, 2.0, 0.5]))
     with torch.no_grad():
-        model.rho_raw.copy_(torch.log(torch.tensor([2.0, 0.5])))
+        model.rho_raw.copy_(raw)
     R = model.resid_corr()
-    assert torch.allclose(torch.diagonal(R), torch.tensor([1.0, 2.0, 0.5]))
+    expected_diag = torch.exp(raw - raw.mean())
+    assert torch.allclose(torch.diagonal(R), expected_diag)
     assert torch.count_nonzero(R - torch.diag(torch.diagonal(R))) == 0
 
     D = model.param_to_sqmatrix(model.D_params, n=1,

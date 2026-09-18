@@ -104,7 +104,8 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         return (idx.unsqueeze(0) - idx.unsqueeze(1)).abs()
 
     def resid_corr(self):
-        """Relative residual correlation R (unit diagonal); σ² is profiled separately."""
+        """Relative residual correlation R; σ² is profiled separately. For kind="diag",
+        R's diagonal has unit geometric mean, making σ² a pooled scale across positions."""
         return self._resid_corr_from_raw(getattr(self, "rho_raw", None))
 
     def _resid_corr_from_raw(self, rho_raw):
@@ -113,11 +114,12 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         if kind == "iid":
             return self.eye_nmax
         if kind == "diag":
-            # The profiled scalar sigma² is the first-position residual variance;
-            # nmax-1 log-variance ratios identify the remaining diagonal entries.
+            # nmax free log-variances, centered so no within-group position is a
+            # privileged reference; the profiled scalar sigma² is their geometric mean.
             if self.nmax == 1:
                 return self.eye_nmax
-            log_var = torch.cat((rho_raw.new_zeros(1), rho_raw.reshape(-1)))
+            raw = rho_raw.reshape(-1)
+            log_var = raw - raw.mean()
             return torch.diag(torch.exp(log_var.clamp(-self.RHO_RAW_MAX,
                                                        self.RHO_RAW_MAX)))
         rho_raw = rho_raw.clamp(-self.RHO_RAW_MAX, self.RHO_RAW_MAX)
@@ -199,20 +201,20 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         return self._rho_raw_from_rho(rho_mom).reshape(1)
 
     def _diagonal_rho_init(self):
-        """Initialize diagonal residual variance ratios from pooled OLS residuals.
+        """Initialize diagonal residual log-variances from pooled OLS residuals.
 
-        The diagonal residual structure is indexed by within-subject position.  The
-        common profiled scale is fixed by the first position, so only the log ratios
-        of the remaining position-wise mean squared residuals are returned.
+        The diagonal residual structure is indexed by within-subject position. Returns
+        nmax centered log-variances (no privileged reference position); the profiled
+        scalar sigma² is their geometric mean.
         """
         dtype = self.y_.dtype
         _, r_g = self._ols_residuals()
         mask = self.mask.to(dtype=dtype)
         counts = mask.sum(dim=0).clamp_min(1.0)
         var_by_position = (r_g.pow(2) * mask).sum(dim=0) / counts
-        var_by_position = var_by_position.clamp_min(1e-8)
-        ratios = var_by_position[1:] / var_by_position[0]
-        return torch.log(ratios).clamp(-self.RHO_RAW_MAX, self.RHO_RAW_MAX)
+        log_var = torch.log(var_by_position.clamp_min(1e-8))
+        rho_raw_init = log_var - log_var.mean()
+        return rho_raw_init.clamp(-self.RHO_RAW_MAX, self.RHO_RAW_MAX)
 
     def _rho_raw_from_rho(self, rho):
         """Invert the link used by _resid_corr_from_raw so a target rho starts the optimizer
@@ -575,10 +577,8 @@ class LinearMixedModelSmoothing(LinearMixedModel):
             epoch = 0
             plateau = 0
             for epoch in range(max_iter_outer):
-                total_loss = opt_joint.step(closure_joint)
+                opt_joint.step(closure_joint)
                 self._project_params()
-
-                loss_check = total_loss.detach()
 
                 grad_norm = sum(
                     p.grad.norm().item() ** 2
@@ -587,10 +587,13 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                 ) ** 0.5
 
                 with torch.no_grad():
+                    # LBFGS.step() returns the closure's pre-step loss; recompute here
+                    # so current_loss/beta_/sigma2 reflect the post-step, post-projection state.
                     D_           = self.param_to_sqmatrix(self.D_params, n=self.pz, correlation_structure=self.rand_D_type)
+                    loss_post, _ = self.loss_fn_reml(D=D_, spline_param=self.spline_params)
                     self.beta_   = self._beta_cache
                     self.sigma2  = self._sigma2_cache
-                    current_loss          = loss_check.item()
+                    current_loss          = loss_post.item()
                     current_sigma2        = self.sigma2.clone().detach()
                     current_D             = D_.clone().detach()
                     current_spline_param  = torch.exp(self.spline_params.clone().detach())
