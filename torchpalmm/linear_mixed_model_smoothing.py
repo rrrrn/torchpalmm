@@ -281,6 +281,17 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                     torch.ones(1, device=self.device, dtype=self.y_.dtype)
                 )
 
+    @staticmethod
+    def _chol_jitter(M, jitter=1e-10, tries=8):
+        """Cholesky of a PSD matrix; grows the jitter tenfold until the factorization succeeds."""
+        I = torch.eye(M.shape[0], device=M.device, dtype=M.dtype)
+        for _ in range(tries):
+            L, info = torch.linalg.cholesky_ex(M + jitter * I)
+            if int(info) == 0:
+                return L
+            jitter *= 10.0
+        return torch.linalg.cholesky(M + jitter * I)
+
     def _reml_relative(self, D, spline_param, R):
         """Relative-scale REML pieces (σ² profiled out). R is the unit-diagonal residual
         correlation. Returns (logdetV, logdet_XtVinvX, rVinv_r, XtVinvX, beta_hat), all in
@@ -324,7 +335,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
 
         M   = A_UU + torch.diag(lam_inv)
         M   = 0.5 * (M + M.transpose(0, 1))
-        L_M = torch.linalg.cholesky(M + 1e-10 * torch.eye(Ktot, device=self.device, dtype=f64))
+        L_M = self._chol_jitter(M)
         logdetM = 2.0 * torch.sum(torch.log(torch.diagonal(L_M)))
         Minv_UX = torch.cholesky_solve(A_UX, L_M)
         Minv_Uy = torch.cholesky_solve(A_Uy, L_M)

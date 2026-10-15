@@ -251,3 +251,13 @@ def test_masked_basis_uses_active_x_only():
     ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=100, fit_type="reml", verbose=False)
     fdf = ss.smooth_confint()
     assert set(fdf.loc[fdf.spline_id == 1, "spline_var"].round(2)) <= set(x[we == 1].round(2))
+
+
+def test_chol_jitter_recovers_slightly_indefinite_matrix():
+    v = torch.randn(30, 1)
+    M = v @ v.T * 1e4                                            # rank 1, PSD
+    M = M - 1e-6 * torch.eye(30)                                 # rounding-sized negative eigenvalues
+    with np.testing.assert_raises(Exception):
+        torch.linalg.cholesky(M + 1e-10 * torch.eye(30))
+    L = LinearMixedModelSmoothing._chol_jitter(M)
+    assert torch.isfinite(L).all()
