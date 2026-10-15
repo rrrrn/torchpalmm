@@ -186,3 +186,47 @@ def test_smooth_mask_levels_and_nb():
     ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=100, fit_type="reml", verbose=False)
     out = ss.summary(names=["day2", "day3"], spline_names=["x1", "x2", "x3"], verbose=False)
     assert len(out["splines"]) == 3
+
+
+def _reference_t_test(m, l):
+    """Uncached Satterthwaite test: recomputes the Hessian and C_theta for every contrast."""
+    from scipy import stats
+    from torch.autograd.functional import hessian
+    th = m._theta_hat().requires_grad_(True)
+    H = hessian(lambda t: m.nll(t), th)
+    A = torch.linalg.inv(0.5 * (H + H.T) + 1e-8 * torch.eye(H.shape[0]))
+    px = m.X_.shape[1]
+    v = torch.zeros(px, 1); v[l] = 1.0
+    f, _ = m.f_theta(th, v)
+    g = torch.autograd.grad(f, th)[0]
+    df = 2.0 * f ** 2 / (g @ A @ g)
+    t = (m.beta.reshape(-1)[l] / torch.sqrt(f)).item()
+    return t, df.item(), 2.0 * (1.0 - stats.t.cdf(abs(t), df.item()))
+
+
+def test_fixed_t_test_cache_matches_reference():
+    y, xr, m, t, ids = _cumulative_data(G=30)
+    ss = SmoothingSplineMixed(y=torch.as_tensor(y).view(-1, 1), X=np.column_stack([t == 2, t == 3]).astype(float),
+                              Z=np.ones((len(y), 1)), spline_inputs=xr, obs_id=ids, smooth_mask=m,
+                              rand_D_type="diagonal")
+    ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=100, fit_type="reml", verbose=False)
+    lmm = ss.lmm
+
+    table = lmm.fixed_t_test()                                  # fills the cache
+    state = lmm._tt_cache
+    for l in range(len(table)):
+        t_ref, df_ref, p_ref = _reference_t_test(lmm, l)
+        assert np.isclose(table[l]["t"], t_ref, rtol=1e-8)
+        assert np.isclose(table[l]["df"], df_ref, rtol=1e-6)
+        assert np.isclose(table[l]["p_value"], p_ref, rtol=1e-6, atol=1e-12)
+
+    assert lmm.fixed_t_test(l=1) == {k: v for k, v in table[1].items() if k != "coef"}
+    assert lmm._tt_cache is state                               # Hessian reused, not recomputed
+    v = lmm.fixed_t_test(l=[1.0, 0.0, -1.0, 0.0, 0.0, 0.0][:len(table)])
+    assert 0.0 <= v["p_value"] <= 1.0
+
+    with torch.no_grad():
+        lmm.sigma2 = lmm.sigma2 * 1.05
+        lmm.spline_params.add_(0.05)
+    lmm.fixed_t_test(l=0)
+    assert lmm._tt_cache is not state                           # refit parameters invalidate the cache

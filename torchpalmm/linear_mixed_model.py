@@ -754,19 +754,36 @@ class LinearMixedModel:
         C = self.C_theta(theta)
         return (l_vec.transpose(0, 1) @ C @ l_vec).squeeze(), C
 
-    def _contrast_test(self, l_vec, theta_hat, A):
+    def _contrast_test(self, l_vec, theta, C, A):
+        """Satterthwaite t-test of l'beta; C = C_theta(theta) with its graph still attached."""
         l_vec = l_vec.to(device=self.device, dtype=self.y_.dtype)
-        f_val, _ = self.f_theta(theta_hat, l_vec)
-        grad_f = torch.autograd.grad(f_val, theta_hat)[0]
+        f = (l_vec.transpose(0, 1) @ C @ l_vec).squeeze()
+        grad_f = torch.autograd.grad(f, theta, retain_graph=True)[0]
         var_f = grad_f @ A @ grad_f
-        se = torch.sqrt(f_val)
+        se = torch.sqrt(f)
         est = (l_vec.transpose(0, 1) @ self.beta.to(self.device)).squeeze()
         t_hat = est / se
-        df = (2.0 * f_val ** 2) / var_f
+        df = (2.0 * f ** 2) / var_f
         from scipy import stats
         p_value = 2.0 * (1.0 - stats.t.cdf(abs(t_hat.item()), df.item()))
         return {"estimate": est.item(), "se": se.item(), "t": t_hat.item(),
                 "df": df.item(), "p_value": float(p_value)}
+
+    def _ttest_state(self):
+        """theta_hat and A = H^{-1}, H the Hessian of the nll at theta_hat. Cached until the
+        fitted parameters change, so repeated tests do not recompute the Hessian."""
+        from torch.autograd.functional import hessian
+        theta = self._theta_hat()
+        key = getattr(self, "fit_type", None)
+        c = getattr(self, "_tt_cache", None)
+        if c is not None and c["key"] == key and c["theta"].shape == theta.shape \
+                and torch.equal(c["theta"], theta):
+            return c
+        H = hessian(lambda th: self.nll(th), theta.clone().requires_grad_(True))
+        H = 0.5 * (H + H.transpose(0, 1))
+        A = torch.linalg.inv(H + 1e-8 * torch.eye(H.shape[0], device=H.device, dtype=H.dtype))
+        self._tt_cache = dict(theta=theta, key=key, A=A, unit={})
+        return self._tt_cache
 
     def fixed_t_test(self, l=None, alpha=0.05):
         """Satterthwaite t-test for fixed effects (ref: lmerTest, Kuznetsova et al. 2017).
@@ -775,29 +792,34 @@ class LinearMixedModel:
         l=int    -> unit contrast e_l for a single coefficient.
         l=vector -> custom contrast of length px.
         Returns a dict with estimate, se, t, df, p_value (or a list of them).
+        The Hessian and the unit-contrast results are cached across calls.
         """
-        from torch.autograd.functional import hessian
         px = self.X_.shape[1]
-        theta_hat = self._theta_hat().requires_grad_(True)
+        if isinstance(l, int) and l >= px:
+            raise ValueError("l must be less than the number of fixed effects.")
+        state = self._ttest_state()
+        unit = state["unit"]
+        todo = list(range(px)) if l is None else [l] if isinstance(l, int) else []
+        todo = [i for i in todo if i not in unit]
 
-        H = hessian(lambda th: self.nll(th), theta_hat)
-        H = 0.5 * (H + H.transpose(0, 1))
-        A = torch.linalg.inv(H + 1e-8 * torch.eye(H.shape[0], device=H.device, dtype=H.dtype))
+        if todo or (l is not None and not isinstance(l, int)):
+            theta = state["theta"].clone().requires_grad_(True)
+            C = self.C_theta(theta)
 
-        def unit(idx):
-            v = torch.zeros((px, 1), device=self.device, dtype=self.y_.dtype)
-            v[idx, 0] = 1.0
-            return v
+            def e(i):
+                v = torch.zeros((px, 1), device=self.device, dtype=self.y_.dtype)
+                v[i, 0] = 1.0
+                return v
+
+            for i in todo:
+                unit[i] = self._contrast_test(e(i), theta, C, state["A"])
+            if l is not None and not isinstance(l, int):
+                l_vec = torch.as_tensor(l, device=self.device, dtype=self.y_.dtype).reshape(px, 1)
+                return self._contrast_test(l_vec, theta, C, state["A"])
 
         if l is None:
-            return [dict(coef=i, **self._contrast_test(unit(i), theta_hat, A)) for i in range(px)]
-        if isinstance(l, int):
-            if l >= px:
-                raise ValueError("l must be less than the number of fixed effects.")
-            l_vec = unit(l)
-        else:
-            l_vec = torch.as_tensor(l, device=self.device, dtype=self.y_.dtype).reshape(px, 1)
-        return self._contrast_test(l_vec, theta_hat, A)
+            return [dict(coef=i, **unit[i]) for i in range(px)]
+        return dict(unit[l])
 
     @staticmethod
     def _stars(p):
