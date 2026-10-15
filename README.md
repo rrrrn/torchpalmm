@@ -48,6 +48,12 @@ ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=200, fit_type="reml")
 ss.get_blup()                # fitted smooth (DataFrame)
 ss.fixed_t_test(0)           # test a fixed covariate
 ss.linearity_test(s=0)       # score test, H0: component 0 is linear
+ss.spline_effect_test(s=0)   # H0: f_0 = 0; Fisher-combined and Wald p-values (DataFrame)
+ss.summary(names=["x"], spline_names=["t"])   # coefficient, variance and smooth-effect tables
+
+# --- time-activated smooths: I(t >= l) * theta_l(x_l); day dummies belong in X ---
+ss = SmoothingSplineMixed(y=y, X=X_day, Z=Z, spline_inputs=x_by_day, obs_id=subject_id,
+                          smooth_mask=mask)   # mask: N x S array of 0/1
 ```
 
 Two notebooks in [`examples/`](examples):
@@ -57,7 +63,7 @@ Two notebooks in [`examples/`](examples):
 - [`vignette.ipynb`](examples/vignette.ipynb) — the full walkthrough: unstructured random
   effects and the Satterthwaite coefficient table, model selection with `lrt_test`,
   the `iid`/`cs`/`ar1`/`exp` residual correlation structures, subject-level BLUPs,
-  several additive smooths in one model, the linearity score test, and scaling behaviour.
+  several additive smooths in one model, the linearity score test, tests that a smooth is null, time-activated smooths (`smooth_mask`), and scaling behaviour.
 
 For the methodology (model, scalable REML, the linearity score test), see:
 
@@ -71,7 +77,7 @@ For the methodology (model, scalable REML, the linearity score test), see:
 | `LinearMixedModel` | (generalized) linear mixed model, REML/ML |
 | `LinearMixedModelSmoothing` | LMM with global additive smooth components |
 | `SmoothingSpline` | a single penalized smoothing spline |
-| `SmoothingSplineMixed` | smoothing-spline mixed model (high-level API) |
+| `SmoothingSplineMixed` | smoothing-spline mixed model (high-level API); `summary()`, `spline_effect_test()`, `smooth_mask=` |
 | `lrt_test` | likelihood-ratio test between two fitted models |
 
 ## Citation

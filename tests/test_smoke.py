@@ -117,3 +117,72 @@ def test_spline_variance_gradient_below_old_floor():
     loss.backward()
     assert torch.isfinite(model.spline_params.grad).all()
     assert model.spline_params.grad.abs().item() > 0
+
+
+def test_summary_and_spline_effect_test():
+    rng = np.random.default_rng(2)
+    G, GRID = 25, 25
+    y, X, Z, sp, ids = [], [], [], [], []
+    for i in range(G):
+        n = int(rng.integers(8, 12))
+        t = np.sort(rng.integers(0, GRID, size=n)) / GRID
+        x = rng.normal(size=n)
+        yi = 0.8 * x + np.sin(2 * np.pi * t) + rng.normal(scale=0.6) + rng.normal(scale=0.5, size=n)
+        y.append(yi); X.append(x); Z.append(np.ones(n)); sp.append(t); ids += [i] * n
+    y = np.concatenate(y); X = np.concatenate(X)[:, None]; Z = np.concatenate(Z)[:, None]
+    sp = np.concatenate(sp); ids = np.array(ids)
+
+    ss = SmoothingSplineMixed(y=torch.as_tensor(y).view(-1, 1), X=X, Z=Z,
+                              spline_inputs=sp, obs_id=ids,
+                              corr_structure="iid", rand_D_type="diagonal")
+    ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=150, fit_type="reml", verbose=False)
+
+    res = ss.spline_effect_test(s=0)
+    for col in ("p_linear", "p_nonlinear", "p_fisher", "p_wald"):
+        assert 0.0 <= float(res[col].iloc[0]) <= 1.0
+    assert bool(res["reject_fisher"].iloc[0]) and bool(res["reject_wald"].iloc[0])  # sin(2 pi t) is strong
+
+    out = ss.summary(names=["x"], spline_names=["t"], verbose=False)
+    assert list(out["coefficients"]["term"]) == ["x", "(Intercept)", "s(t) linear"]
+    assert {"coefficients", "variance", "splines"} <= set(out)
+
+
+def _cumulative_data(G=40, T=3, seed=4):
+    rng = np.random.default_rng(seed)
+    xs = rng.uniform(0, 1, size=(G, T))
+    t = np.tile(np.arange(1, T + 1), G)
+    ids = np.repeat(np.arange(G), T)
+    xr = np.repeat(xs, T, axis=0)                                  # row r: subject's x_1..x_T
+    m = (t[:, None] >= np.arange(1, T + 1)[None, :]).astype(float)
+    f = lambda l, x: np.sin(2 * np.pi * x) * (l == 1) + (x - 0.5) * (l == 2) + 0 * x
+    y = sum(m[:, l] * f(l + 1, xr[:, l]) for l in range(T)) + 0.3 * t
+    y = y + np.repeat(rng.normal(scale=0.5, size=G), T) + rng.normal(scale=0.3, size=G * T)
+    return y, xr, m, t, ids
+
+
+def test_smooth_mask_levels_and_nb():
+    import warnings
+    y, xr, m, t, ids = _cumulative_data()
+    Z = np.ones((len(y), 1))
+    yt = torch.as_tensor(y).view(-1, 1)
+    kw = dict(y=yt, Z=Z, spline_inputs=xr, obs_id=ids, smooth_mask=m, rand_D_type="diagonal")
+
+    X_nolevel = np.zeros((len(y), 1))                              # no time effects in X
+    import pytest
+    with pytest.warns(UserWarning, match="time-specific intercepts"):
+        ss = SmoothingSplineMixed(X=X_nolevel, **kw)
+    assert ss.level_names == ["level(s2)", "level(s3)"]
+
+    X_time = np.column_stack([(t == k).astype(float) for k in (2, 3)])   # day dummies
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        ss = SmoothingSplineMixed(X=X_time, **kw)
+    assert ss.level_names == []
+
+    NB1 = ss.NB_list[1]                                            # spline 2: inactive on day 1
+    assert torch.all(NB1[:, 0, :] == 0) and not torch.all(NB1[:, 1, :] == 0)
+    assert ss.NB_list[0].abs().sum() > 0
+
+    ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=100, fit_type="reml", verbose=False)
+    out = ss.summary(names=["day2", "day3"], spline_names=["x1", "x2", "x3"], verbose=False)
+    assert len(out["splines"]) == 3

@@ -1,4 +1,5 @@
 import warnings
+import pandas as pd
 import torch
 def _checktensor(x):
     if not torch.is_tensor(x):
@@ -797,6 +798,58 @@ class LinearMixedModel:
         else:
             l_vec = torch.as_tensor(l, device=self.device, dtype=self.y_.dtype).reshape(px, 1)
         return self._contrast_test(l_vec, theta_hat, A)
+
+    @staticmethod
+    def _stars(p):
+        return "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "." if p < 0.1 else ""
+
+    def coef_table(self, names=None, alpha=0.05):
+        """Fixed effects: estimate, se, Satterthwaite df, t, p, (1 - alpha) CI."""
+        if not hasattr(self, "beta"):
+            raise ValueError("Model not fitted yet.")
+        from scipy import stats
+        rows = self.fixed_t_test(l=None, alpha=alpha)
+        names = list(names) if names is not None else [f"X{i + 1}" for i in range(len(rows))]
+        if len(names) != len(rows):
+            raise ValueError(f"names has {len(names)} entries, expected {len(rows)}.")
+        tab = pd.DataFrame(rows).drop(columns="coef")
+        tab.insert(0, "term", names)
+        q = stats.t.ppf(1.0 - alpha / 2.0, tab["df"].to_numpy())
+        tab["ci_lower"] = tab["estimate"] - q * tab["se"]
+        tab["ci_upper"] = tab["estimate"] + q * tab["se"]
+        tab["sig"] = [self._stars(p) for p in tab["p_value"]]
+        return tab
+
+    def variance_table(self, re_names=None):
+        """sigma^2 and the nonzero entries of D."""
+        s2 = self.sigma2.detach().cpu()
+        D = self.D.detach().cpu()
+        q = D.shape[0]
+        re_names = list(re_names) if re_names is not None else [f"b{i + 1}" for i in range(q)]
+        rows = [dict(component="residual", variance=s2.diagonal().mean().item() if s2.dim() == 2 else float(s2))]
+        rows += [dict(component=f"Var({re_names[i]})", variance=D[i, i].item()) for i in range(q)]
+        rows += [dict(component=f"Cov({re_names[j]}, {re_names[i]})", variance=D[i, j].item())
+                 for i in range(q) for j in range(i) if D[i, j].item() != 0.0]
+        return pd.DataFrame(rows)
+
+    def summary(self, names=None, re_names=None, alpha=0.05, verbose=True):
+        """Returns {"coefficients", "variance"} DataFrames; prints them if verbose."""
+        out = dict(coefficients=self.coef_table(names=names, alpha=alpha),
+                   variance=self.variance_table(re_names=re_names))
+        if verbose:
+            self._print_summary(out)
+        return out
+
+    def _print_summary(self, out):
+        with pd.option_context("display.float_format", lambda v: f"{v:.4g}"):
+            print("Fixed effects (Satterthwaite t-tests)")
+            print(out["coefficients"].to_string(index=False))
+            print("\nVariance components")
+            print(out["variance"].to_string(index=False))
+            if "splines" in out:
+                print("\nSmooth terms (H0: f = 0)")
+                print(out["splines"].to_string(index=False))
+            print("\nSignif. codes: 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1")
 
     # --- Hypothesis testing for random effects ---
     # Boundary score test (Lin 1997; Zhang & Lin 2003): U = S+ - e at H0,

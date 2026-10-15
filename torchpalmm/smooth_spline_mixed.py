@@ -1,7 +1,9 @@
 
+import warnings
 import torch
 from .smooth_spline import SmoothingSpline
 from .linear_mixed_model_smoothing import LinearMixedModelSmoothing, _checktensor
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
@@ -61,7 +63,7 @@ class SmoothingSplineMixed(SmoothingSpline):
         return NB, B, input_tilde, input_tilde_unique, group_indices
     
     def __init__(self, y, X, Z, spline_inputs, obs_id, device=None, corr_structure = 'iid', rand_D_type = 'diagonal',
-                 rand_D_estimate = 'sample'):
+                 rand_D_estimate = 'sample', smooth_mask=None):
         self.corr_structure = corr_structure; self.rand_D_type = rand_D_type; self.rand_D_estimate = rand_D_estimate
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -80,11 +82,19 @@ class SmoothingSplineMixed(SmoothingSpline):
         self.unique_spline_vec = [torch.sort(torch.unique(self.spline_inputs[:, i]))[0] for i in range(self.spline_inputs.shape[1])]
         self.obs_id = obs_id
 
+        S = self.spline_inputs.shape[1]
+        m = self._check_mask(smooth_mask, S)
+        self.smooth_mask = m
         X_fit = self.X; NB_list = []; B_list = []; self.spline_linear_col_idx = []
         self.spline_linear_center = []
-        for i in range(self.spline_inputs.shape[1]):
+        for i in range(S):
             sp = self.spline_inputs[:, i]
             NB, B, input_tilde, _, group_indices = self.prepare_design_matrix(sp, torch.unique(sp), obs_id)
+            if m is not None:
+                pad = torch.nn.utils.rnn.pad_sequence(group_indices, batch_first=True)
+                valid = torch.arange(pad.shape[1], device=pad.device)[None, :] < torch.tensor(
+                    [g.numel() for g in group_indices], device=pad.device)[:, None]
+                NB = NB * (m[:, i][pad] * valid).unsqueeze(-1)
             NB_list.append(NB); B_list.append(B)
 
             # Center the slope column; stacked trends are badly conditioned otherwise.
@@ -92,12 +102,17 @@ class SmoothingSplineMixed(SmoothingSpline):
             self.spline_linear_center.append(slope_mean)
             input_tilde = input_tilde.clone()
             input_tilde[:, 1] = input_tilde[:, 1] - slope_mean
+            if m is not None:
+                input_tilde[:, 1] = m[:, i] * input_tilde[:, 1]
 
             if i == 0:
                 X_fit = torch.hstack((X_fit, input_tilde))
             else:
                 X_fit = torch.hstack((X_fit, input_tilde[:, 1:]))
             self.spline_linear_col_idx.append(X_fit.shape[1] - 1)
+        self.level_names = []
+        if m is not None:
+            X_fit, self.level_names = self._add_level_columns(X_fit, m)
         self.NB_list = NB_list; self.B_list = B_list; self.group_indices = group_indices
 
         _G = len(self.group_indices)
@@ -107,6 +122,34 @@ class SmoothingSplineMixed(SmoothingSpline):
         self.obs_flat_idx = obs_flat_idx
 
         self.X_fit = X_fit.to(device=self.device)
+
+    def _check_mask(self, smooth_mask, S):
+        """Validate the N x S activation mask (None = every spline active on every row)."""
+        if smooth_mask is None:
+            return None
+        m = _checktensor(smooth_mask).to(device=self.device)
+        if m.dim() == 1:
+            m = m.unsqueeze(1)
+        if m.shape != (self.y.shape[0], S):
+            raise ValueError(f"smooth_mask must be N x S = {(self.y.shape[0], S)}, got {tuple(m.shape)}.")
+        if not torch.isfinite(m).all() or (m.abs().sum(0) == 0).any():
+            raise ValueError("smooth_mask must be finite with no all-zero column.")
+        return m.to(torch.float64)
+
+    def _add_level_columns(self, X_fit, m, tol=1e-8):
+        """Masked splines are identified only up to the level m_s * c_s, which the global intercept
+        absorbs only if m_s is constant. Check that each m_s lies in span([X, 1]) (e.g. time dummies
+        in X); append the columns that do not. Returns (X_fit, names of appended columns)."""
+        A = torch.cat([self.X.to(torch.float64).cpu(), torch.ones(self.X.shape[0], 1, dtype=torch.float64)], dim=1)
+        mc = m.cpu()
+        resid = mc - A @ torch.linalg.lstsq(A, mc, driver="gelsd").solution
+        missing = [s for s in range(m.shape[1])
+                   if resid[:, s].norm() > tol * max(mc[:, s].norm().item(), 1.0)]
+        if missing:
+            warnings.warn(f"smooth_mask: no time-specific intercepts for splines {missing} in X; "
+                          f"adding the masked level columns. Pass time dummies in X to control them.")
+            X_fit = torch.cat([X_fit, m[:, missing].to(X_fit.dtype)], dim=1)
+        return X_fit, [f"level(s{s + 1})" for s in missing]
 
     def fit(self, warm_start=True, lr=1e-3, max_iter=1000, optimizer=torch.optim.Adam,
         tol=1e-6, max_iter_inner=10, convg_check="loss", fit_type="reml", grad_control_tol=1e-2,
@@ -281,6 +324,34 @@ class SmoothingSplineMixed(SmoothingSpline):
 
         return self.fitted_df, self.rand_effects
 
+    def _posterior_precision(self):
+        """Posterior precision H of (beta, a) given the REML variance components, and the
+        prior variances lam of a. Cov(beta, a | y) = H^{-1}."""
+        f64 = torch.float64
+        lmm = self.lmm
+        G, nm, K, p = lmm.n_groups, lmm.nmax, lmm.K_tot, self.X_fit.shape[1]
+        mask = lmm.mask.unsqueeze(-1)
+        mask2 = mask @ mask.transpose(1, 2)
+
+        ZDZ = (lmm.masked_Z @ self.D @ lmm.masked_Z.transpose(-1, -2)).to(f64)
+        V0 = (self.sigma2 * lmm.resid_corr().unsqueeze(0) + ZDZ) * mask2 \
+             + (1.0 - mask2) * lmm.eye_nmax * 1e6
+        L0 = torch.linalg.cholesky(0.5 * (V0 + V0.transpose(-1, -2)))
+
+        X = (lmm.X_grouped * mask).to(f64)
+        U = lmm.U_grouped.to(f64)
+        ViX = torch.cholesky_solve(X, L0).reshape(G * nm, p)
+        ViU = torch.cholesky_solve(U, L0).reshape(G * nm, K)
+        X, U = X.reshape(G * nm, p), U.reshape(G * nm, K)
+
+        lam = torch.repeat_interleave(self.tau_sq_list.to(f64), lmm._K_repeats)
+        H = torch.zeros(p + K, p + K, dtype=f64, device=self.device)
+        H[:p, :p] = X.T @ ViX
+        H[p:, :p] = U.T @ ViX
+        H[:p, p:] = H[p:, :p].T
+        H[p:, p:] = U.T @ ViU + torch.diag(1.0 / lam)
+        return 0.5 * (H + H.T) + 1e-10 * torch.eye(p + K, dtype=f64, device=self.device), lam
+
     def smooth_confint(self, alpha=0.05, col_smooth=None, z=None):
         """Pointwise confidence band for each smooth, conditional on the REML variance
         components (mgcv's default). Refs: Wahba (1983); Nychka (1988)."""
@@ -290,31 +361,10 @@ class SmoothingSplineMixed(SmoothingSpline):
         device, f64 = self.device, torch.float64
         z = float(norm.ppf(1.0 - alpha / 2.0)) if z is None else z
 
-        lmm      = self.lmm
-        G, nm    = lmm.n_groups, lmm.nmax
-        Ktot, p  = lmm.K_tot, self.X_fit.shape[1]
-        mask_vec = lmm.mask.unsqueeze(-1)
-        mask_mat = mask_vec @ mask_vec.transpose(1, 2)
-
-        ZDZ  = (lmm.masked_Z @ self.D @ lmm.masked_Z.transpose(-1, -2)).to(f64)
-        V0   = (self.sigma2 * lmm.resid_corr().unsqueeze(0) + ZDZ) * mask_mat \
-               + (1.0 - mask_mat) * lmm.eye_nmax * 1e6
-        L_V0 = torch.linalg.cholesky(0.5 * (V0 + V0.transpose(-1, -2)))
-
-        X   = (lmm.X_grouped * mask_vec).to(f64)
-        U   = lmm.U_grouped.to(f64)
-        ViX = torch.cholesky_solve(X, L_V0).reshape(G * nm, p)
-        ViU = torch.cholesky_solve(U, L_V0).reshape(G * nm, Ktot)
-        Xm, Um = X.reshape(G * nm, p), U.reshape(G * nm, Ktot)
-
-        lam = torch.repeat_interleave(self.tau_sq_list.to(f64), lmm._K_repeats)
-        H   = torch.zeros(p + Ktot, p + Ktot, dtype=f64, device=device)
-        H[:p, :p] = Xm.T @ ViX
-        H[p:, :p] = Um.T @ ViX
-        H[:p, p:] = H[p:, :p].T
-        H[p:, p:] = Um.T @ ViU + torch.diag(1.0 / lam)
-        L_H = torch.linalg.cholesky(0.5 * (H + H.T)
-                                    + 1e-10 * torch.eye(p + Ktot, dtype=f64, device=device))
+        lmm = self.lmm
+        p, Ktot = self.X_fit.shape[1], lmm.K_tot
+        H, _ = self._posterior_precision()
+        L_H = torch.linalg.cholesky(H)
 
         self.get_blup(col_smooth=col_smooth, random_effects=False)
         fdf = self.fitted_df
@@ -363,3 +413,87 @@ class SmoothingSplineMixed(SmoothingSpline):
         if not hasattr(self, "lmm"):
             raise ValueError("Model not fitted yet.")
         return self.lmm.linearity_test(s=s, alpha=alpha, null_fit_kwargs=null_fit_kwargs)
+
+    def _wald_smooth(self, c, fitted, H, L_H, lam):
+        """Wood (2013) Wald test of H0: f_c = 0, f_c = slope * (x - center) + B_c a_c, at the
+        observed x. Statistic f' V_f^- f with V_f = Cov(f | y) truncated to rank
+        r = round(edf). Returns (edf, stat, r, p)."""
+        from scipy import stats
+        f64, dev = torch.float64, self.device
+        lmm = self.lmm
+        p, K = self.X_fit.shape[1], lmm.K_tot
+        off = np.concatenate([[0], np.cumsum(lmm.K_list)])
+        cols = torch.cat([torch.tensor([int(self.spline_linear_col_idx[c])], device=dev),
+                          torch.arange(p + off[c], p + off[c + 1], device=dev)])
+
+        x = torch.sort(self.unique_spline_vec[c].to(dev))[0].to(f64)
+        E = torch.cat([(x - self.spline_linear_center[c].to(device=dev, dtype=f64)).unsqueeze(1),
+                       self.B_list[c].to(dev).to(f64)], dim=1)
+
+        Hinv = torch.cholesky_solve(torch.eye(p + K, dtype=f64, device=dev), L_H)
+        pen = torch.cat([torch.zeros(p, dtype=f64, device=dev), 1.0 / lam])
+        edf = torch.diagonal(Hinv @ (H - torch.diag(pen)))[cols].sum().item()
+
+        Q, R = torch.linalg.qr(E)
+        M = R @ Hinv[cols][:, cols] @ R.T
+        f = torch.as_tensor(fitted["theta_fitted"].to_numpy().copy(), dtype=f64, device=dev)
+        if c == 0:
+            f = f - self.beta[self.px].reshape(()).to(f64)
+        w = Q.T @ f
+
+        ev, V = torch.linalg.eigh(0.5 * (M + M.T))
+        ev, V = ev.flip(0), V.flip(1)
+        r = int(min(max(round(edf), 1), ev.numel()))
+        stat = ((V[:, :r].T @ w) ** 2 / ev[:r]).sum().item()
+        return edf, stat, r, float(stats.chi2.sf(stat, r))
+
+    def spline_effect_test(self, s=None, alpha=0.05, null_fit_kwargs=None):
+        """H0: f_s = 0 for spline s (None = all). One row per spline, two tests:
+        Fisher: -2 (log p_linear + log p_nonlinear) ~ chi2_4, combining the t-test of the
+          linear trend with the boundary score test of tau_s^2 = 0 (asymptotically independent).
+        Wald: Wood (2013)-style Wald test of the fitted smooth, chi2_r."""
+        if not hasattr(self, "lmm"):
+            raise ValueError("Model not fitted yet.")
+        from scipy import stats
+        H, lam = self._posterior_precision()
+        L_H = torch.linalg.cholesky(H)
+        fdf = self.get_blup(random_effects=False)[0]
+
+        rows = []
+        for c in (range(self.spline_inputs.shape[1]) if s is None else [s]):
+            lin = self.lmm.fixed_t_test(l=int(self.spline_linear_col_idx[c]), alpha=alpha)
+            nonlin = self.lmm.linearity_test(s=c, alpha=alpha, null_fit_kwargs=null_fit_kwargs)
+            stat = -2.0 * np.log(np.maximum([lin["p_value"], nonlin["p_value"]], 1e-300)).sum()
+            p_fisher = float(stats.chi2.sf(stat, 4))
+            edf, w_stat, w_df, p_wald = self._wald_smooth(c, fdf[fdf["spline_id"] == c], H, L_H, lam)
+            rows.append(dict(spline_id=c, t_linear=lin["t"], p_linear=lin["p_value"],
+                             score_stat=nonlin["statistic"], p_nonlinear=nonlin["p_value"],
+                             fisher_stat=stat, p_fisher=p_fisher,
+                             edf=edf, wald_stat=w_stat, wald_df=w_df, p_wald=p_wald,
+                             reject_fisher=bool(p_fisher < alpha), reject_wald=bool(p_wald < alpha)))
+        return pd.DataFrame(rows)
+
+    def summary(self, names=None, spline_names=None, re_names=None, alpha=0.05,
+                verbose=True, null_fit_kwargs=None):
+        """Returns {"coefficients", "variance", "splines"} DataFrames; prints them if verbose.
+        Coefficient rows: X, spline intercept, linear slope of each spline."""
+        if not hasattr(self, "lmm"):
+            raise ValueError("Model not fitted yet.")
+        S = self.spline_inputs.shape[1]
+        names = list(names) if names is not None else [f"X{i + 1}" for i in range(self.px)]
+        sp = list(spline_names) if spline_names is not None else [f"spline{j + 1}" for j in range(S)]
+        if len(names) != self.px or len(sp) != S:
+            raise ValueError(f"names needs {self.px} entries and spline_names {S}.")
+        coefs = self.lmm.coef_table(names=names + ["(Intercept)"] + [f"s({n}) linear" for n in sp] + self.level_names,
+                                        alpha=alpha)
+
+        tau = pd.DataFrame(dict(component=[f"tau2 s({n})" for n in sp],
+                                variance=self.tau_sq_list.detach().cpu().numpy()))
+        var = pd.concat([self.lmm.variance_table(re_names=re_names), tau], ignore_index=True)
+
+        tests = self.spline_effect_test(alpha=alpha, null_fit_kwargs=null_fit_kwargs)
+        tests.insert(1, "term", [f"s({sp[c]})" for c in tests["spline_id"]])
+        out = dict(coefficients=coefs, variance=var, splines=tests)
+        if verbose:
+            self.lmm._print_summary(out)
+        return out
