@@ -79,17 +79,24 @@ class SmoothingSplineMixed(SmoothingSpline):
         self.spline_inputs = _checktensor(spline_inputs).to(device=self.device)
         if len(self.spline_inputs.shape) == 1:
             self.spline_inputs = self.spline_inputs.unsqueeze(1)
-        self.unique_spline_vec = [torch.sort(torch.unique(self.spline_inputs[:, i]))[0] for i in range(self.spline_inputs.shape[1])]
         self.obs_id = obs_id
 
         S = self.spline_inputs.shape[1]
         m = self._check_mask(smooth_mask, S)
         self.smooth_mask = m
+        # knots: distinct x on the rows where the spline is active (all rows when unmasked)
+        self.unique_spline_vec = []
+        for i in range(S):
+            sp = self.spline_inputs[:, i]
+            u = torch.sort(torch.unique(sp if m is None else sp[m[:, i] != 0]))[0]
+            if u.numel() < 3:
+                raise ValueError(f"spline {i} has {u.numel()} distinct active x-values; at least 3 are needed.")
+            self.unique_spline_vec.append(u)
         X_fit = self.X; NB_list = []; B_list = []; self.spline_linear_col_idx = []
         self.spline_linear_center = []
         for i in range(S):
             sp = self.spline_inputs[:, i]
-            NB, B, input_tilde, _, group_indices = self.prepare_design_matrix(sp, torch.unique(sp), obs_id)
+            NB, B, input_tilde, _, group_indices = self.prepare_design_matrix(sp, self.unique_spline_vec[i], obs_id)
             if m is not None:
                 pad = torch.nn.utils.rnn.pad_sequence(group_indices, batch_first=True)
                 valid = torch.arange(pad.shape[1], device=pad.device)[None, :] < torch.tensor(

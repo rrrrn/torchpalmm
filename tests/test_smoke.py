@@ -230,3 +230,24 @@ def test_fixed_t_test_cache_matches_reference():
         lmm.spline_params.add_(0.05)
     lmm.fixed_t_test(l=0)
     assert lmm._tt_cache is not state                           # refit parameters invalidate the cache
+
+
+def test_masked_basis_uses_active_x_only():
+    rng = np.random.default_rng(5)
+    G, ni = 60, 6
+    N = G * ni
+    ids = np.repeat(np.arange(G), ni)
+    we = (np.tile(np.arange(ni), G) >= 4).astype(float)             # last 2 rows of each subject
+    x = np.round(rng.uniform(0, 1, N), 2)
+    x[we == 1] = np.round(rng.uniform(0.3, 0.7, int(we.sum())), 2)  # weekend x covers a sub-range only
+    y = np.sin(2 * np.pi * x) + we * 0.5 * (x - 0.5) + rng.normal(scale=0.3, size=N) \
+        + np.repeat(rng.normal(scale=0.5, size=G), ni)
+    ss = SmoothingSplineMixed(y=torch.as_tensor(y).view(-1, 1), X=we[:, None], Z=np.ones((N, 1)),
+                              spline_inputs=np.column_stack([x, x]), obs_id=ids,
+                              smooth_mask=np.column_stack([np.ones(N), we]), rand_D_type="diagonal")
+    n_active = np.unique(x[we == 1]).size
+    assert ss.NB_list[1].shape[2] == n_active - 2 < ss.NB_list[0].shape[2]
+    assert ss.level_names == []
+    ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=100, fit_type="reml", verbose=False)
+    fdf = ss.smooth_confint()
+    assert set(fdf.loc[fdf.spline_id == 1, "spline_var"].round(2)) <= set(x[we == 1].round(2))
