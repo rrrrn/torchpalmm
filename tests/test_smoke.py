@@ -303,3 +303,27 @@ def test_summary_prints_only_when_displayed(capsys):
     assert capsys.readouterr().out == ""                       # building / returning it prints nothing
     text = repr(out)
     assert "Fixed effects" in text and "Variance components" in text and isinstance(out, dict)
+
+
+def test_lbfgs_survives_nonfinite_trial_points(monkeypatch):
+    rng = np.random.default_rng(0)
+    G, ni = 40, 6
+    N = G * ni
+    ids = np.repeat(np.arange(G), ni)
+    x = np.round(rng.uniform(0, 1, N), 2)
+    y = np.sin(2 * np.pi * x) + rng.normal(scale=0.3, size=N) + np.repeat(rng.normal(scale=0.5, size=G), ni)
+    ss = SmoothingSplineMixed(y=torch.as_tensor(y).view(-1, 1), X=rng.normal(size=(N, 1)), Z=np.ones((N, 1)),
+                              spline_inputs=x, obs_id=ids, rand_D_type="diagonal")
+    ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=100, fit_type="reml", verbose=False)
+
+    orig = LinearMixedModelSmoothing.loss_fn_reml
+
+    def bad(self, D, spline_param):
+        loss, s2 = orig(self, D, spline_param)
+        if spline_param.detach().abs().max() > 4.0:             # objective is not finite here
+            loss = loss * float("nan")
+        return loss, s2
+
+    monkeypatch.setattr(LinearMixedModelSmoothing, "loss_fn_reml", bad)
+    ss.lmm.fit_likelihood(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=200, fit_type="REML", verbose=False)
+    assert torch.isfinite(torch.as_tensor(ss.lmm.final_loss)) and ss.lmm.convg == 1

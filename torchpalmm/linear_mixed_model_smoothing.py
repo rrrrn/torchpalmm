@@ -582,7 +582,13 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                 opt_joint.zero_grad()
                 D_ = self.param_to_sqmatrix(self.D_params, n=self.pz, correlation_structure=self.rand_D_type)
                 loss, _ = self.loss_fn_reml(D=D_, spline_param=self.spline_params)
-                loss.backward()
+                if torch.isfinite(loss):
+                    loss.backward()
+                if not torch.isfinite(loss) or not all(torch.isfinite(q.grad).all() for q in lbfgs_params):
+                    # non-finite trial point: report a very bad finite value so the line search backs off
+                    for q in lbfgs_params:
+                        q.grad = torch.zeros_like(q)
+                    return loss.detach().new_tensor(1e12)
                 return loss
 
             convg = 0
