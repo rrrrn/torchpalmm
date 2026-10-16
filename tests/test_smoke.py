@@ -261,3 +261,20 @@ def test_chol_jitter_recovers_slightly_indefinite_matrix():
         torch.linalg.cholesky(M + 1e-10 * torch.eye(30))
     L = LinearMixedModelSmoothing._chol_jitter(M)
     assert torch.isfinite(L).all()
+
+
+def test_zero_spline_variance_stays_finite():
+    rng = np.random.default_rng(1)
+    G, ni = 60, 6
+    N = G * ni
+    ids = np.repeat(np.arange(G), ni)
+    x = np.round(rng.uniform(0, 1, N), 2)
+    y = 0.8 * x + rng.normal(scale=0.4, size=N) + np.repeat(rng.normal(scale=0.5, size=G), ni)
+    ss = SmoothingSplineMixed(y=torch.as_tensor(y).view(-1, 1), X=rng.normal(size=(N, 1)), Z=np.ones((N, 1)),
+                              spline_inputs=x, obs_id=ids, rand_D_type="diagonal")
+    ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=100, fit_type="reml", verbose=False)
+    ss.tau_sq_list = torch.zeros_like(ss.tau_sq_list)            # exactly linear smooth
+    res = ss.spline_effect_test()
+    assert np.isfinite(res[["edf", "wald_stat", "p_wald"]].to_numpy()).all()
+    assert abs(float(res["edf"].iloc[0]) - 1.0) < 1e-3
+    assert np.isfinite(ss.smooth_confint()[["lower", "upper"]].to_numpy()).all()

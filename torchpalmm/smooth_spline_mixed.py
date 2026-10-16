@@ -286,7 +286,7 @@ class SmoothingSplineMixed(SmoothingSpline):
         A_UU  = Um.transpose(0, 1) @ BiU.reshape(G * nm, Ktot)
         UtBir = Um.transpose(0, 1) @ Bir.reshape(G * nm, 1)
 
-        lam   = torch.repeat_interleave(self.tau_sq_list.to(f64), lmm._K_repeats)
+        lam   = self._lam()
         M     = A_UU + torch.diag(1.0 / lam)
         M     = 0.5 * (M + M.transpose(0, 1))
         L_M   = torch.linalg.cholesky(M + 1e-10 * torch.eye(Ktot, device=device, dtype=f64))
@@ -331,6 +331,13 @@ class SmoothingSplineMixed(SmoothingSpline):
 
         return self.fitted_df, self.rand_effects
 
+    def _lam(self):
+        """Prior variances of the spline coefficients, floored at sigma^2 * exp(-20), the lower
+        bound the fit uses, so 1/lam stays finite when a smooth is exactly linear."""
+        floor = float(self.sigma2) * float(np.exp(-20.0))
+        tau = self.tau_sq_list.to(torch.float64).clamp(min=floor)
+        return torch.repeat_interleave(tau, self.lmm._K_repeats)
+
     def _posterior_precision(self):
         """Posterior precision H of (beta, a) given the REML variance components, and the
         prior variances lam of a. Cov(beta, a | y) = H^{-1}."""
@@ -351,7 +358,7 @@ class SmoothingSplineMixed(SmoothingSpline):
         ViU = torch.cholesky_solve(U, L0).reshape(G * nm, K)
         X, U = X.reshape(G * nm, p), U.reshape(G * nm, K)
 
-        lam = torch.repeat_interleave(self.tau_sq_list.to(f64), lmm._K_repeats)
+        lam = self._lam()
         H = torch.zeros(p + K, p + K, dtype=f64, device=self.device)
         H[:p, :p] = X.T @ ViX
         H[p:, :p] = U.T @ ViX
