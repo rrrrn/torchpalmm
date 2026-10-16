@@ -578,17 +578,25 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                 history_size=10, line_search_fn="strong_wolfe"
             )
 
+            evaluated = [False]
+
             def closure_joint():
                 opt_joint.zero_grad()
                 D_ = self.param_to_sqmatrix(self.D_params, n=self.pz, correlation_structure=self.rand_D_type)
-                loss, _ = self.loss_fn_reml(D=D_, spline_param=self.spline_params)
+                try:
+                    loss, _ = self.loss_fn_reml(D=D_, spline_param=self.spline_params)
+                except torch.linalg.LinAlgError:
+                    if not evaluated[0]:
+                        raise                       # the starting point itself is invalid
+                    loss = torch.tensor(float("nan"), dtype=torch.float64, device=self.device)
                 if torch.isfinite(loss):
                     loss.backward()
                 if not torch.isfinite(loss) or not all(torch.isfinite(q.grad).all() for q in lbfgs_params):
-                    # non-finite trial point: report a very bad finite value so the line search backs off
+                    # failed or non-finite trial point: report a very bad finite value so the line search backs off
                     for q in lbfgs_params:
                         q.grad = torch.zeros_like(q)
                     return loss.detach().new_tensor(1e12)
+                evaluated[0] = True
                 return loss
 
             convg = 0
