@@ -49,7 +49,7 @@ ss.get_blup()                # fitted smooth (DataFrame)
 ss.fixed_t_test(0)           # test a fixed covariate
 ss.linearity_test(s=0)       # score test, H0: component 0 is linear
 ss.spline_effect_test(s=0)   # H0: f_0 = 0; Fisher-combined and Wald p-values (DataFrame)
-ss.summary(names=["x"], spline_names=["t"])   # coefficient, variance and smooth-effect tables
+ss.summary(names=["x"], spline_names=["t"])   # DataFrames; prints as tables when displayed (res = ss.summary(...) stays silent)
 
 # --- time-activated smooths: I(t >= l) * theta_l(x_l); day dummies belong in X ---
 ss = SmoothingSplineMixed(y=y, X=X_day, Z=Z, spline_inputs=x_by_day, obs_id=subject_id,

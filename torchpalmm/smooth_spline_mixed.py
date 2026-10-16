@@ -2,6 +2,7 @@
 import warnings
 import torch
 from .smooth_spline import SmoothingSpline
+from .linear_mixed_model import SummaryResult
 from .linear_mixed_model_smoothing import LinearMixedModelSmoothing, _checktensor
 import numpy as np
 import pandas as pd
@@ -366,9 +367,12 @@ class SmoothingSplineMixed(SmoothingSpline):
         H[p:, p:] = U.T @ ViU + torch.diag(1.0 / lam)
         return 0.5 * (H + H.T) + 1e-10 * torch.eye(p + K, dtype=f64, device=self.device), lam
 
-    def smooth_confint(self, alpha=0.05, col_smooth=None, z=None):
+    def smooth_confint(self, alpha=0.05, col_smooth=None, z=None, with_mean=False):
         """Pointwise confidence band for each smooth, conditional on the REML variance
-        components (mgcv's default). Refs: Wahba (1983); Nychka (1988)."""
+        components. with_mean=False (mgcv's seWithMean=FALSE) returns the smooth centered over
+        its x-grid, with the uncertainty of its shape only; with_mean=True keeps the level (the
+        intercept for the first smooth) and its uncertainty, which Marra & Wood (2012) report
+        gives better coverage. Refs: Wahba (1983); Nychka (1988)."""
         if not hasattr(self, "beta"):
             raise ValueError("Model not fitted yet.")
         from scipy.stats import norm
@@ -397,9 +401,12 @@ class SmoothingSplineMixed(SmoothingSpline):
             if c == 0:
                 E[:, self.px] = 1.0
             E[:, p + offsets[c]: p + offsets[c + 1]] = self.B_list[c].to(device).to(f64)
+            sub = fdf[fdf["spline_id"] == c].copy()
+            if not with_mean:
+                E = E - E.mean(0, keepdim=True)
+                sub["theta_fitted"] = sub["theta_fitted"] - sub["theta_fitted"].mean()
             var = (E * torch.cholesky_solve(E.T, L_H).T).sum(1).clamp(min=0.0)
             se  = torch.sqrt(var).detach().cpu().numpy()
-            sub = fdf[fdf["spline_id"] == c].copy()
             sub["se"]    = se
             sub["lower"] = sub["theta_fitted"] - z * se
             sub["upper"] = sub["theta_fitted"] + z * se
@@ -487,9 +494,8 @@ class SmoothingSplineMixed(SmoothingSpline):
                              reject_fisher=bool(p_fisher < alpha), reject_wald=bool(p_wald < alpha)))
         return pd.DataFrame(rows)
 
-    def summary(self, names=None, spline_names=None, re_names=None, alpha=0.05,
-                verbose=True, null_fit_kwargs=None):
-        """Returns {"coefficients", "variance", "splines"} DataFrames; prints them if verbose.
+    def summary(self, names=None, spline_names=None, re_names=None, alpha=0.05, null_fit_kwargs=None):
+        """{"coefficients", "variance", "splines"} DataFrames; displays as formatted tables when printed.
         Coefficient rows: X, spline intercept, linear slope of each spline."""
         if not hasattr(self, "lmm"):
             raise ValueError("Model not fitted yet.")
@@ -507,7 +513,4 @@ class SmoothingSplineMixed(SmoothingSpline):
 
         tests = self.spline_effect_test(alpha=alpha, null_fit_kwargs=null_fit_kwargs)
         tests.insert(1, "term", [f"s({sp[c]})" for c in tests["spline_id"]])
-        out = dict(coefficients=coefs, variance=var, splines=tests)
-        if verbose:
-            self.lmm._print_summary(out)
-        return out
+        return SummaryResult(coefficients=coefs, variance=var, splines=tests)

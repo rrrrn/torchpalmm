@@ -142,7 +142,7 @@ def test_summary_and_spline_effect_test():
         assert 0.0 <= float(res[col].iloc[0]) <= 1.0
     assert bool(res["reject_fisher"].iloc[0]) and bool(res["reject_wald"].iloc[0])  # sin(2 pi t) is strong
 
-    out = ss.summary(names=["x"], spline_names=["t"], verbose=False)
+    out = ss.summary(names=["x"], spline_names=["t"])
     assert list(out["coefficients"]["term"]) == ["x", "(Intercept)", "s(t) linear"]
     assert {"coefficients", "variance", "splines"} <= set(out)
 
@@ -184,7 +184,7 @@ def test_smooth_mask_levels_and_nb():
     assert ss.NB_list[0].abs().sum() > 0
 
     ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=100, fit_type="reml", verbose=False)
-    out = ss.summary(names=["day2", "day3"], spline_names=["x1", "x2", "x3"], verbose=False)
+    out = ss.summary(names=["day2", "day3"], spline_names=["x1", "x2", "x3"])
     assert len(out["splines"]) == 3
 
 
@@ -278,3 +278,28 @@ def test_zero_spline_variance_stays_finite():
     assert np.isfinite(res[["edf", "wald_stat", "p_wald"]].to_numpy()).all()
     assert abs(float(res["edf"].iloc[0]) - 1.0) < 1e-3
     assert np.isfinite(ss.smooth_confint()[["lower", "upper"]].to_numpy()).all()
+
+
+def test_smooth_confint_with_mean_option():
+    y, xr, m, t, ids = _cumulative_data(G=40)
+    ss = SmoothingSplineMixed(y=torch.as_tensor(y).view(-1, 1), X=np.column_stack([t == 2, t == 3]).astype(float),
+                              Z=np.ones((len(y), 1)), spline_inputs=xr, obs_id=ids, smooth_mask=m,
+                              rand_D_type="diagonal")
+    ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=100, fit_type="reml", verbose=False)
+    a = ss.smooth_confint(with_mean=True)
+    b = ss.smooth_confint()
+    for c in range(3):
+        ac, bc = a[a.spline_id == c], b[b.spline_id == c]
+        assert abs(bc["theta_fitted"].mean()) < 1e-10                       # centered over the grid
+        assert np.allclose(ac["theta_fitted"] - ac["theta_fitted"].mean(), bc["theta_fitted"])
+        assert (bc["se"].to_numpy() <= ac["se"].to_numpy() + 1e-10).all()   # shape-only band is not wider
+    assert (b[b.spline_id == 0]["se"].to_numpy() < a[a.spline_id == 0]["se"].to_numpy()).all()
+
+
+def test_summary_prints_only_when_displayed(capsys):
+    from torchpalmm.linear_mixed_model import SummaryResult
+    out = SummaryResult(coefficients=__import__("pandas").DataFrame({"term": ["a"], "estimate": [1.0]}),
+                        variance=__import__("pandas").DataFrame({"component": ["residual"], "variance": [2.0]}))
+    assert capsys.readouterr().out == ""                       # building / returning it prints nothing
+    text = repr(out)
+    assert "Fixed effects" in text and "Variance components" in text and isinstance(out, dict)

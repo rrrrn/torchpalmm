@@ -6,6 +6,23 @@ def _checktensor(x):
         x = torch.tensor(x)
     return x
 
+class SummaryResult(dict):
+    """Dict of summary DataFrames; printing it (or leaving it as a cell's last expression) shows the tables."""
+
+    def _text(self):
+        with pd.option_context("display.float_format", lambda v: f"{v:.4g}"):
+            parts = ["Fixed effects (Satterthwaite t-tests)", self["coefficients"].to_string(index=False),
+                     "\nVariance components", self["variance"].to_string(index=False)]
+            if "splines" in self:
+                parts += ["\nSmooth terms (H0: f = 0)", self["splines"].to_string(index=False)]
+        return "\n".join(parts + ["\nSignif. codes: 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1"])
+
+    __repr__ = __str__ = _text
+
+    def _repr_pretty_(self, p, cycle):
+        p.text(self._text())
+
+
 class LinearMixedModel:
     # Raw correlation parameters are held in [-RHO_RAW_MAX, RHO_RAW_MAX]. At the bound the
     # implied rho is already 0.99995, whereas past |raw| ~ 19 the links saturate to exactly
@@ -854,24 +871,10 @@ class LinearMixedModel:
                  for i in range(q) for j in range(i) if D[i, j].item() != 0.0]
         return pd.DataFrame(rows)
 
-    def summary(self, names=None, re_names=None, alpha=0.05, verbose=True):
-        """Returns {"coefficients", "variance"} DataFrames; prints them if verbose."""
-        out = dict(coefficients=self.coef_table(names=names, alpha=alpha),
-                   variance=self.variance_table(re_names=re_names))
-        if verbose:
-            self._print_summary(out)
-        return out
-
-    def _print_summary(self, out):
-        with pd.option_context("display.float_format", lambda v: f"{v:.4g}"):
-            print("Fixed effects (Satterthwaite t-tests)")
-            print(out["coefficients"].to_string(index=False))
-            print("\nVariance components")
-            print(out["variance"].to_string(index=False))
-            if "splines" in out:
-                print("\nSmooth terms (H0: f = 0)")
-                print(out["splines"].to_string(index=False))
-            print("\nSignif. codes: 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1")
+    def summary(self, names=None, re_names=None, alpha=0.05):
+        """{"coefficients", "variance"} DataFrames; displays as formatted tables when printed."""
+        return SummaryResult(coefficients=self.coef_table(names=names, alpha=alpha),
+                             variance=self.variance_table(re_names=re_names))
 
     # --- Hypothesis testing for random effects ---
     # Boundary score test (Lin 1997; Zhang & Lin 2003): U = S+ - e at H0,
