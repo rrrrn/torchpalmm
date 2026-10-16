@@ -339,6 +339,17 @@ class SmoothingSplineMixed(SmoothingSpline):
         tau = self.tau_sq_list.to(torch.float64).clamp(min=floor)
         return torch.repeat_interleave(tau, self.lmm._K_repeats)
 
+    @staticmethod
+    def _chol_retry(H, n_tries=12):
+        """Cholesky of H, adding growing diagonal jitter (relative to mean(diag H)) if H is numerically singular."""
+        eye, scale, jit = torch.eye(H.shape[0], dtype=H.dtype, device=H.device), H.diagonal().mean(), 0.0
+        for _ in range(n_tries):
+            L, info = torch.linalg.cholesky_ex(H + jit * eye)
+            if int(info) == 0:
+                return L
+            jit = scale * 1e-12 if jit == 0.0 else jit * 10.0
+        return torch.linalg.cholesky(H + jit * eye)
+
     def _posterior_precision(self):
         """Posterior precision H of (beta, a) given the REML variance components, and the
         prior variances lam of a. Cov(beta, a | y) = H^{-1}."""
@@ -382,7 +393,7 @@ class SmoothingSplineMixed(SmoothingSpline):
         lmm = self.lmm
         p, Ktot = self.X_fit.shape[1], lmm.K_tot
         H, _ = self._posterior_precision()
-        L_H = torch.linalg.cholesky(H)
+        L_H = self._chol_retry(H)
 
         self.get_blup(col_smooth=col_smooth, random_effects=False)
         fdf = self.fitted_df
@@ -477,7 +488,7 @@ class SmoothingSplineMixed(SmoothingSpline):
             raise ValueError("Model not fitted yet.")
         from scipy import stats
         H, lam = self._posterior_precision()
-        L_H = torch.linalg.cholesky(H)
+        L_H = self._chol_retry(H)
         fdf = self.get_blup(random_effects=False)[0]
 
         rows = []
