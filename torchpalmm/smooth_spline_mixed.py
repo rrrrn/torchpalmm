@@ -147,17 +147,20 @@ class SmoothingSplineMixed(SmoothingSpline):
     def _add_level_columns(self, X_fit, m, tol=1e-8):
         """Masked splines are identified only up to the level m_s * c_s, which the global intercept
         absorbs only if m_s is constant. Check that each m_s lies in span([X, 1]) (e.g. time dummies
-        in X); append the columns that do not. Returns (X_fit, names of appended columns)."""
+        in X); append only the columns that add new information (one per distinct mask). Returns (X_fit, names of appended columns)."""
         A = torch.cat([self.X.to(torch.float64).cpu(), torch.ones(self.X.shape[0], 1, dtype=torch.float64)], dim=1)
         mc = m.cpu()
-        resid = mc - A @ torch.linalg.lstsq(A, mc, driver="gelsd").solution
-        missing = [s for s in range(m.shape[1])
-                   if resid[:, s].norm() > tol * max(mc[:, s].norm().item(), 1.0)]
-        if missing:
-            warnings.warn(f"smooth_mask: no time-specific intercepts for splines {missing} in X; "
+        added = []
+        for s in range(m.shape[1]):
+            resid = mc[:, s] - A @ torch.linalg.lstsq(A, mc[:, s:s + 1], driver="gelsd").solution.squeeze(-1)
+            if resid.norm() > tol * max(mc[:, s].norm().item(), 1.0):
+                added.append(s)
+                A = torch.cat([A, mc[:, s:s + 1]], dim=1)
+        if added:
+            warnings.warn(f"smooth_mask: no time-specific intercepts for splines {added} in X; "
                           f"adding the masked level columns. Pass time dummies in X to control them.")
-            X_fit = torch.cat([X_fit, m[:, missing].to(X_fit.dtype)], dim=1)
-        return X_fit, [f"level(s{s + 1})" for s in missing]
+            X_fit = torch.cat([X_fit, m[:, added].to(X_fit.dtype)], dim=1)
+        return X_fit, [f"level(s{s + 1})" for s in added]
 
     def fit(self, warm_start=True, lr=1e-3, max_iter=1000, optimizer=torch.optim.Adam,
         tol=1e-6, max_iter_inner=10, convg_check="loss", fit_type="reml", grad_control_tol=1e-2,

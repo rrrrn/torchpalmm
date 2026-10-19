@@ -1,6 +1,7 @@
 """Smoke tests: fit on tiny synthetic data and check the public API behaves."""
 
 import numpy as np
+import pytest
 import torch
 
 from torchpalmm import LinearMixedModel, SmoothingSplineMixed
@@ -350,3 +351,16 @@ def test_lbfgs_survives_cholesky_failure_at_trial_points(monkeypatch):
     monkeypatch.setattr(LinearMixedModelSmoothing, "loss_fn_reml", bad)
     ss.lmm.fit_likelihood(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=200, fit_type="REML", verbose=False)
     assert ss.lmm.convg == 1
+
+
+def test_level_columns_skip_duplicate_masks():
+    torch.manual_seed(0)
+    n = 60
+    t = torch.arange(n).float() % 6
+    m = (t >= 2).double()
+    ss = SmoothingSplineMixed.__new__(SmoothingSplineMixed)
+    ss.X = torch.randn(n, 2).double()
+    X_fit = ss.X.clone()
+    with pytest.warns(UserWarning):
+        X2, names = ss._add_level_columns(X_fit, torch.stack([m, m, 1 - m], 1))
+    assert names == ["level(s1)"] and X2.shape[1] == 3
