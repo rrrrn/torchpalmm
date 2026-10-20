@@ -364,3 +364,17 @@ def test_level_columns_skip_duplicate_masks():
     with pytest.warns(UserWarning):
         X2, names = ss._add_level_columns(X_fit, torch.stack([m, m, 1 - m], 1))
     assert names == ["level(s1)"] and X2.shape[1] == 3
+
+
+def test_null_refit_warm_start_matches_cold():
+    torch.manual_seed(1)
+    G, m = 20, 8
+    ids = np.repeat(np.arange(G), m)
+    x = np.random.rand(G * m, 2)
+    y = torch.as_tensor(np.sin(3 * x[:, 0]) + 0.5 * x[:, 1] + np.repeat(np.random.randn(G), m) + 0.3 * np.random.randn(G * m)).view(-1, 1)
+    ss = SmoothingSplineMixed(y=y, X=np.random.randn(G * m, 1), Z=np.ones((G * m, 1)), spline_inputs=x, obs_id=ids,
+                              corr_structure="iid", rand_D_type="diagonal")
+    ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=150, fit_type="reml", verbose=False)
+    warm = ss.lmm.linearity_test(s=0)["p_value"]
+    cold = ss.lmm.linearity_test(s=0, null_fit_kwargs=dict(init=None))["p_value"]
+    assert abs(warm - cold) < 1e-3

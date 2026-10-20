@@ -478,8 +478,10 @@ class LinearMixedModelSmoothing(LinearMixedModel):
     def fit_likelihood(self, optimizer=torch.optim.Adam, lr=1e-3, max_iter=1000, fit_type="REML",
                        tol=1e-6, warm_start=True, verbose=False, convg_check="loss",
                        max_iter_inner=10, tau_lr_mult=5.0, group_chunk=None, grad_control_tol=1e-2,
-                       corr_init_method="moment", plateau_patience=5):
+                       corr_init_method="moment", plateau_patience=5, init=None):
         """
+        init             : dict with D_params, spline_params (log tau^2) and optionally rho_raw,
+                           used as the starting values in place of the default initialization.
         tau_lr_mult      : lr multiplier for spline_params vs D_params in Adam.
         group_chunk      : process groups in chunks; reduces peak memory at 2x Cholesky cost.
         corr_init_method : "fixed" (rho_raw=0) or "moment" (default; data-driven
@@ -492,6 +494,10 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         """
         beta, sigma2 = self.reset_params(OLS=warm_start, estimate=self.rand_D_estimate,
                                          corr_init_method=corr_init_method)
+        if init is not None:
+            with torch.no_grad():
+                for name, val in init.items():
+                    getattr(self, name).copy_(val)
 
         self._group_chunk = group_chunk
 
@@ -746,9 +752,14 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         y = self.y_ if y is None else _checktensor(y).to(self.device).view(-1, 1)
         nfk = dict(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=200,
                    verbose=False, convg_check="loss")
+        others = [j for j in range(self.len_spline) if j != s]
+        if others and hasattr(self, "D_params"):
+            nfk["init"] = dict(D_params=self.D_params.detach(),
+                               spline_params=self.spline_params.detach()[others])
+            if self._has_corr_params():
+                nfk["init"]["rho_raw"] = self.rho_raw.detach()
         if null_fit_kwargs:
             nfk.update(null_fit_kwargs)
-        others = [j for j in range(self.len_spline) if j != s]
 
         if others:
             null = LinearMixedModelSmoothing(
