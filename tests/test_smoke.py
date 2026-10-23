@@ -378,3 +378,48 @@ def test_null_refit_warm_start_matches_cold():
     warm = ss.lmm.linearity_test(s=0)["p_value"]
     cold = ss.lmm.linearity_test(s=0, null_fit_kwargs=dict(init=None))["p_value"]
     assert abs(warm - cold) < 1e-3
+
+
+def test_blup_exposes_intercept_separately():
+    torch.manual_seed(2)
+    G, m = 15, 8
+    ids = np.repeat(np.arange(G), m)
+    x = np.random.rand(G * m, 1)
+    y = torch.as_tensor(5 + np.sin(3 * x[:, 0]) + np.random.randn(G * m) * 0.3).view(-1, 1)
+    ss = SmoothingSplineMixed(y=y, X=np.random.randn(G * m, 1), Z=np.ones((G * m, 1)), spline_inputs=x, obs_id=ids,
+                              corr_structure="iid", rand_D_type="diagonal")
+    ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=100, fit_type="reml", verbose=False)
+    f = ss.get_blup(random_effects=False)[0]
+    assert np.allclose(f["theta_fitted"] - f["theta_no_intercept"], ss.intercept)
+
+
+def test_fitted_values_masked_smooth_and_conditional():
+    torch.manual_seed(3)
+    G, m = 20, 10
+    ids = np.repeat(np.arange(G), m)
+    t = np.tile(np.arange(m), G)
+    x = np.round(np.random.rand(G * m, 1), 1)
+    mask = (t >= 3).astype(float)[:, None]
+    days = (t[:, None] == np.arange(4, m)).astype(float)
+    y = torch.as_tensor(50 + np.sin(3 * x[:, 0]) * mask[:, 0] + np.repeat(np.random.randn(G), m) + 0.3 * np.random.randn(G * m)).view(-1, 1)
+    ss = SmoothingSplineMixed(y=y, X=days[:, :3], Z=np.ones((G * m, 1)), spline_inputs=x, obs_id=ids, smooth_mask=mask,
+                              corr_structure="iid", rand_D_type="diagonal")
+    ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=100, fit_type="reml", verbose=False)
+    marg, cond = ss.fitted_values(), ss.fitted_values(conditional=True)
+    assert marg.shape == (G * m,) and abs(ss.residuals(conditional=False).mean()) < 5
+    assert np.sum((y.numpy().ravel() - cond) ** 2) < np.sum((y.numpy().ravel() - marg) ** 2)
+
+
+def test_smooth_sum_confint_matches_single_smooth():
+    torch.manual_seed(4)
+    G, m = 15, 8
+    ids = np.repeat(np.arange(G), m)
+    x = np.round(np.random.rand(G * m, 2), 1)
+    y = torch.as_tensor(np.sin(3 * x[:, 0]) + np.random.randn(G * m) * 0.3).view(-1, 1)
+    ss = SmoothingSplineMixed(y=y, X=np.random.randn(G * m, 1), Z=np.ones((G * m, 1)), spline_inputs=x, obs_id=ids,
+                              corr_structure="iid", rand_D_type="diagonal")
+    ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=100, fit_type="reml", verbose=False)
+    one = ss.smooth_confint(col_smooth=1)
+    sm = ss.smooth_sum_confint([1])
+    assert np.allclose(one["upper"].to_numpy(), sm["upper"].to_numpy(), atol=1e-6)
+    assert (ss.smooth_sum_confint([0, 1])["se"] >= 0).all()

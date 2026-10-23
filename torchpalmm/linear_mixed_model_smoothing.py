@@ -95,8 +95,9 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         return kind in ("cs", "ar1", "exp") or (kind == "diag" and self.nmax > 1)
 
     def _project_params(self):
-        if self._has_corr_params():
-            with torch.no_grad():
+        with torch.no_grad():
+            self.spline_params.data.clamp_(-20.0, 20.0)   # loss clamps log tau^2 here; beyond it the gradient is 0
+            if self._has_corr_params():
                 self.rho_raw.data.clamp_(-self.RHO_RAW_MAX, self.RHO_RAW_MAX)
 
     def _lag_matrix(self):

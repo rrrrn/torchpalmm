@@ -248,7 +248,11 @@ class SmoothingSplineMixed(SmoothingSpline):
         return NB_final
 
     def get_blup(self, col_smooth=None, random_effects=True):
-
+        """Fitted curves in self.fitted_df (one row per distinct x of each smooth).
+        theta_fitted for smooth 0 includes the global intercept beta[px]; with smooth_mask that
+        smooth is active on a subset of rows, so do not rebuild fitted values as mask * theta_fitted.
+        theta_no_intercept is theta_fitted without the intercept (all smooths), and the intercept is
+        stored in self.intercept: add it to every row once, e.g. X_fit @ beta + sum_c mask_c * f_c(x)."""
         if not hasattr(self, 'beta'):
             raise ValueError("Model not fitted yet.")
 
@@ -295,6 +299,7 @@ class SmoothingSplineMixed(SmoothingSpline):
         M     = 0.5 * (M + M.transpose(0, 1))
         L_M   = torch.linalg.cholesky(M + 1e-10 * torch.eye(Ktot, device=device, dtype=f64))
         a_hat = torch.cholesky_solve(UtBir, L_M).squeeze(-1)              # [Ktot] = E[a|y]
+        self._a_hat = a_hat.detach()
 
         offsets = [0]
         for k in lmm.K_list:
@@ -316,9 +321,11 @@ class SmoothingSplineMixed(SmoothingSpline):
                 "spline_id": c,
                 "spline_var": Xeval.detach().cpu().numpy(),
                 "theta_fitted": theta_fitted.detach().cpu().numpy(),
+                "theta_no_intercept": (theta_fitted - (float(self.beta[self.px]) if c == 0 else 0.0)).detach().cpu().numpy(),
             }))
 
         self.fitted_df = pd.concat(fitted_list, ignore_index=True)
+        self.intercept = float(self.beta[self.px])
 
         if random_effects:
             # V⁻¹r = B⁻¹r − B⁻¹U â
@@ -380,6 +387,71 @@ class SmoothingSplineMixed(SmoothingSpline):
         H[:p, p:] = H[p:, :p].T
         H[p:, p:] = U.T @ ViU + torch.diag(1.0 / lam)
         return 0.5 * (H + H.T) + 1e-10 * torch.eye(p + K, dtype=f64, device=self.device), lam
+
+    def posterior_moments(self):
+        """(mu, H): posterior mean [beta; a] of length p + K_tot and its precision H, so
+        Cov = H^{-1}, conditional on the REML variance components."""
+        if not hasattr(self, "beta"):
+            raise ValueError("Model not fitted yet.")
+        self.get_blup(random_effects=False)
+        H, _ = self._posterior_precision()
+        return torch.cat([self.beta.reshape(-1).to(torch.float64), self._a_hat]), H
+
+    def smooth_sum_confint(self, ids, weights=None, alpha=0.05, with_mean=False):
+        """Pointwise band for sum_c w_c f_c(x) on the x values shared by the smooths in ids,
+        using their joint posterior covariance (e.g. ids=[0, 1] for f_ref + delta). Smooth 0
+        carries the intercept; with_mean=False centers the curve over the grid."""
+        from scipy.stats import norm
+        f64, dev = torch.float64, self.device
+        ids = list(ids)
+        w = np.ones(len(ids)) if weights is None else np.asarray(weights, float)
+        grid = self.unique_spline_vec[ids[0]]
+        for c in ids[1:]:
+            grid = grid[torch.isin(grid, self.unique_spline_vec[c])]
+        if grid.numel() == 0:
+            raise ValueError("The smooths share no x values.")
+        mu, H = self.posterior_moments()
+        L_H = self._chol_retry(H)
+        p, Ktot = self.X_fit.shape[1], self.lmm.K_tot
+        off = np.cumsum([0] + list(self.lmm.K_list))
+        E = torch.zeros(grid.numel(), p + Ktot, dtype=f64, device=dev)
+        for c, wc in zip(ids, w):
+            u = self.unique_spline_vec[c]
+            idx = torch.searchsorted(u, grid)
+            E[:, int(self.spline_linear_col_idx[c])] += wc * (grid.to(f64) - self.spline_linear_center[c].to(device=dev, dtype=f64))
+            if c == 0:
+                E[:, self.px] += wc
+            E[:, p + off[c]: p + off[c + 1]] += wc * self.B_list[c].to(dev).to(f64)[idx]
+        if not with_mean:
+            E = E - E.mean(0, keepdim=True)
+        fit = (E @ mu).detach().cpu().numpy()
+        se = torch.sqrt((E * torch.cholesky_solve(E.T, L_H).T).sum(1).clamp(min=0.0)).detach().cpu().numpy()
+        z = float(norm.ppf(1.0 - alpha / 2.0))
+        return pd.DataFrame({"spline_var": grid.detach().cpu().numpy(), "fitted": fit, "se": se,
+                             "lower": fit - z * se, "upper": fit + z * se})
+
+    def fitted_values(self, conditional=False):
+        """Per-row fitted values (N,), in input order. Marginal: X_fit beta + sum_c mask_c f_c^smooth(x),
+        with the intercept counted once on every row. conditional=True adds Z b_hat."""
+        if not hasattr(self, "beta"):
+            raise ValueError("Model not fitted yet.")
+        self.get_blup(random_effects=conditional)
+        f64, dev = torch.float64, self.device
+        off = np.cumsum([0] + list(self.lmm.K_list))
+        fit = (self.X_fit.to(f64) @ self.beta.to(f64)).reshape(-1)
+        for c in range(self.spline_inputs.shape[1]):
+            u = self.unique_spline_vec[c]
+            idx = torch.searchsorted(u, self.spline_inputs[:, c].contiguous()).clamp(max=u.numel() - 1)
+            sm = self.B_list[c].to(dev).to(f64)[idx] @ self._a_hat[off[c]:off[c + 1]]
+            fit = fit + (sm if self.smooth_mask is None else self.smooth_mask[:, c].to(f64) * sm)
+        if conditional:
+            _, inv = torch.unique(self.obs_id.to(dev), sorted=True, return_inverse=True)
+            fit = fit + (self.Z.to(f64) * self.rand_effects[inv]).sum(1)
+        return fit.detach().cpu().numpy()
+
+    def residuals(self, conditional=True):
+        """y minus fitted_values(conditional), one per row, in input order."""
+        return self.y.reshape(-1).detach().cpu().numpy() - self.fitted_values(conditional=conditional)
 
     def smooth_confint(self, alpha=0.05, col_smooth=None, z=None, with_mean=False):
         """Pointwise confidence band for each smooth, conditional on the REML variance
