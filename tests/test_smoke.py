@@ -73,7 +73,7 @@ def test_diagonal_residual_variance_in_both_trees():
     model = LinearMixedModelSmoothing(
         y=y, X=X, Z=Z, id=ids, spline_inputs=[NB],
         corr_structure="diagonal", rand_D_type="diagonal")
-    expected_init = model._diagonal_rho_init()
+    expected_init = model._init_rho_raw("moment")
     model.reset_params(OLS=False)
     assert model.rho_raw.numel() == ni
     assert torch.allclose(model.rho_raw, expected_init)
@@ -198,7 +198,7 @@ def _reference_t_test(m, l):
     A = torch.linalg.inv(0.5 * (H + H.T) + 1e-8 * torch.eye(H.shape[0]))
     px = m.X_.shape[1]
     v = torch.zeros(px, 1); v[l] = 1.0
-    f, _ = m.f_theta(th, v)
+    f = (v.T @ m.C_theta(th) @ v).squeeze()
     g = torch.autograd.grad(f, th)[0]
     df = 2.0 * f ** 2 / (g @ A @ g)
     t = (m.beta.reshape(-1)[l] / torch.sqrt(f)).item()
@@ -254,13 +254,13 @@ def test_masked_basis_uses_active_x_only():
     assert set(fdf.loc[fdf.spline_id == 1, "spline_var"].round(2)) <= set(x[we == 1].round(2))
 
 
-def test_chol_jitter_recovers_slightly_indefinite_matrix():
+def test_robust_cholesky_recovers_slightly_indefinite_matrix():
     v = torch.randn(30, 1)
     M = v @ v.T * 1e4                                            # rank 1, PSD
     M = M - 1e-6 * torch.eye(30)                                 # rounding-sized negative eigenvalues
     with np.testing.assert_raises(Exception):
         torch.linalg.cholesky(M + 1e-10 * torch.eye(30))
-    L = LinearMixedModelSmoothing._chol_jitter(M)
+    L, _ = LinearMixedModelSmoothing._robust_cholesky(M)
     assert torch.isfinite(L).all()
 
 
@@ -423,3 +423,43 @@ def test_smooth_sum_confint_matches_single_smooth():
     sm = ss.smooth_sum_confint([1])
     assert np.allclose(one["upper"].to_numpy(), sm["upper"].to_numpy(), atol=1e-6)
     assert (ss.smooth_sum_confint([0, 1])["se"] >= 0).all()
+
+
+def test_smoothing_ml_fit_matches_reml_shape():
+    rng = np.random.default_rng(0)
+    G, ni = 40, 6
+    N = G * ni
+    ids = np.repeat(np.arange(G), ni)
+    x = np.round(rng.uniform(0, 1, N), 2)
+    y = np.sin(2 * np.pi * x) + rng.normal(scale=0.3, size=N) + np.repeat(rng.normal(scale=0.5, size=G), ni)
+    ss = SmoothingSplineMixed(y=torch.as_tensor(y).view(-1, 1), X=rng.normal(size=(N, 1)), Z=np.ones((N, 1)),
+                              spline_inputs=x, obs_id=ids, rand_D_type="diagonal")
+    ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=150, fit_type="ml", verbose=False)
+    assert ss.lmm.convg == 1 and ss.lmm.fit_type == "ml"
+    assert torch.isfinite(torch.as_tensor(ss.lmm.final_loss))
+    assert ss.lmm.fixed_t_test(l=0)["p_value"] >= 0.0
+
+
+def test_smoothing_spline_single_curve():
+    from torchpalmm import SmoothingSpline
+    t = np.repeat(np.arange(30) / 30, 4)
+    y = (np.sin(2 * np.pi * t) + np.random.default_rng(0).normal(scale=0.3, size=t.size))[:, None]
+    sp = SmoothingSpline(y=y, spline_inputs=t, device="cpu")
+    sp.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=150, fit_type="reml", verbose=False)
+    curve = sp.get_fitted_theta()
+    assert len(curve) == 30 and np.isfinite(curve["theta_fitted"]).all()
+
+
+def test_random_restarts_keep_best_fit():
+    rng = np.random.default_rng(0)
+    G, ni = 30, 6
+    N = G * ni
+    ids = np.repeat(np.arange(G), ni)
+    x = np.round(rng.uniform(0, 1, N), 2)
+    y = np.sin(2 * np.pi * x) + rng.normal(scale=0.3, size=N) + np.repeat(rng.normal(scale=0.5, size=G), ni)
+    ss = SmoothingSplineMixed(y=torch.as_tensor(y).view(-1, 1), X=rng.normal(size=(N, 1)), Z=np.ones((N, 1)),
+                              spline_inputs=x, obs_id=ids, rand_D_type="diagonal")
+    ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=100, fit_type="reml", verbose=False)
+    base = ss.lmm.final_loss
+    ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=100, fit_type="reml", verbose=False, n_restarts=3)
+    assert ss.lmm.final_loss <= base + 1e-8

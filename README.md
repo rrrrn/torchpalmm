@@ -76,7 +76,7 @@ For the methodology (model, scalable REML, the linearity score test), see:
 |---|---|
 | `LinearMixedModel` | (generalized) linear mixed model, REML/ML |
 | `LinearMixedModelSmoothing` | LMM with global additive smooth components |
-| `SmoothingSpline` | a single penalized smoothing spline |
+| `SmoothingSpline` | a single penalized smoothing spline (`SmoothingSplineMixed` with one group, no random effects) |
 | `SmoothingSplineMixed` | smoothing-spline mixed model (high-level API); `summary()`, `spline_effect_test()`, `smooth_mask=` |
 | `lrt_test` | likelihood-ratio test between two fitted models |
 

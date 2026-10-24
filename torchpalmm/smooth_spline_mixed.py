@@ -1,14 +1,45 @@
 
+import copy
 import warnings
 import torch
-from .smooth_spline import SmoothingSpline
 from .linear_mixed_model import SummaryResult
 from .linear_mixed_model_smoothing import LinearMixedModelSmoothing, _checktensor
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-class SmoothingSplineMixed(SmoothingSpline):
+class SmoothingSplineMixed:
+    @staticmethod
+    def construct_Q(x):
+        x = x.flatten()
+        n = x.shape[0]
+        h = x[1:] - x[:-1]
+
+        Q = torch.zeros((n, n-2), dtype=x.dtype, device=x.device)
+        cols = torch.arange(n-2)
+        Q[cols, cols] = 1.0 / h[cols]
+        Q[cols + 1, cols] = -1.0 / h[cols] - 1.0 / h[cols + 1]
+        Q[cols + 2, cols] = 1.0 / h[cols + 1]
+        return Q
+
+    @staticmethod
+    def construct_R(x):
+        x = x.flatten()
+        n = x.shape[0]
+        h = x[1:] - x[:-1]
+
+        R = torch.zeros((n-2, n-2), dtype=x.dtype, device=x.device)
+        cols = torch.arange(n-2)
+        R[cols, cols] = (h[cols] + h[cols + 1]) / 3.0
+        cols = torch.arange(n-3)
+        R[cols + 1, cols] = h[cols+1] / 6.0
+        R[cols, cols + 1] = h[cols+1] / 6.0
+        return R
+
+    @staticmethod
+    def construct_Omega(x):
+        return SmoothingSplineMixed.construct_Q(x), SmoothingSplineMixed.construct_R(x)
+
     @staticmethod
     def construct_incidence_matrix(origin_vec, unique_vec, ids):
         # returns (incidence [G, nmax, m], group indices)
@@ -33,7 +64,7 @@ class SmoothingSplineMixed(SmoothingSpline):
             incidence_matrices[g, :group_size, :] = matches.float()
 
         return incidence_matrices, group_indices
-    
+
     @staticmethod
     def prepare_design_matrix(original_vec, unique_vec, ids):
         unique_vec = torch.sort(unique_vec, descending=False)[0]
@@ -41,28 +72,20 @@ class SmoothingSplineMixed(SmoothingSpline):
 
         C = torch.linalg.cholesky(R)
         I = torch.eye(R.shape[0], dtype=R.dtype, device=R.device)
-        S = torch.linalg.solve(C, I)  # C^{-1}
-        L = Q @ S  # m x m-2
+        S = torch.linalg.solve_triangular(C, I, upper=False)
+        L = Q @ S
 
         Nmtx, group_indices = SmoothingSplineMixed.construct_incidence_matrix(original_vec, unique_vec, ids)
 
-        # random-effect design for the spline
-        LtL = L.T @ L
-        I_m2 = torch.eye(LtL.shape[0], device=L.device, dtype=L.dtype)
-        jitter = 1e-10
-        for _ in range(10):
-            chol, info = torch.linalg.cholesky_ex(LtL + jitter * I_m2)
-            if int(info) == 0:
-                break
-            jitter *= 10.0
-        B = torch.cholesky_solve(L.T, chol).T  # m x m-2
-        NB = Nmtx @ B  # [G, nmax, m-2]
+        # random-effect design for the spline: B = L (L'L)^{-1}
+        B = torch.linalg.pinv(L).T
+        NB = Nmtx @ B
 
         # [1, x] parametric part
         input_tilde = torch.stack((torch.ones_like(original_vec), original_vec), dim=1)
         input_tilde_unique = torch.stack((torch.ones_like(unique_vec), unique_vec), dim=1)
         return NB, B, input_tilde, input_tilde_unique, group_indices
-    
+
     def __init__(self, y, X, Z, spline_inputs, obs_id, device=None, corr_structure = 'iid', rand_D_type = 'diagonal',
                  rand_D_estimate = 'sample', smooth_mask=None):
         self.corr_structure = corr_structure; self.rand_D_type = rand_D_type; self.rand_D_estimate = rand_D_estimate
@@ -142,13 +165,13 @@ class SmoothingSplineMixed(SmoothingSpline):
             raise ValueError(f"smooth_mask must be N x S = {(self.y.shape[0], S)}, got {tuple(m.shape)}.")
         if not torch.isfinite(m).all() or (m.abs().sum(0) == 0).any():
             raise ValueError("smooth_mask must be finite with no all-zero column.")
-        return m.to(torch.float64)
+        return m
 
     def _add_level_columns(self, X_fit, m, tol=1e-8):
         """Masked splines are identified only up to the level m_s * c_s, which the global intercept
         absorbs only if m_s is constant. Check that each m_s lies in span([X, 1]) (e.g. time dummies
         in X); append only the columns that add new information (one per distinct mask). Returns (X_fit, names of appended columns)."""
-        A = torch.cat([self.X.to(torch.float64).cpu(), torch.ones(self.X.shape[0], 1, dtype=torch.float64)], dim=1)
+        A = torch.cat([self.X.cpu(), torch.ones(self.X.shape[0], 1, dtype=torch.float64)], dim=1)
         mc = m.cpu()
         added = []
         for s in range(m.shape[1]):
@@ -164,62 +187,35 @@ class SmoothingSplineMixed(SmoothingSpline):
 
     def fit(self, warm_start=True, lr=1e-3, max_iter=1000, optimizer=torch.optim.Adam,
         tol=1e-6, max_iter_inner=10, convg_check="loss", fit_type="reml", grad_control_tol=1e-2,
-        tau_lr_mult=5.0, verbose=True, backfit=False, n_restarts=1, rho_init="moment"):
-        if backfit:
-            raise NotImplementedError("backfit fitting has been removed.")
+        tau_lr_mult=5.0, verbose=True, n_restarts=1, rho_init="moment"):
         self.lmm = LinearMixedModelSmoothing(device=self.device, y=self.y, X=self.X_fit, Z=self.Z,
                                             spline_inputs=self.NB_list,
-                                            id=self.obs_id, corr_structure=self.corr_structure, rand_D_type=self.rand_D_type)
+                                            id=self.obs_id, corr_structure=self.corr_structure, rand_D_type=self.rand_D_type, rand_D_estimate=self.rand_D_estimate)
         self.lmm.fit_likelihood(lr=lr, max_iter=max_iter, tol=tol, verbose=verbose, optimizer=optimizer, fit_type=fit_type, warm_start=warm_start,
                                     max_iter_inner=max_iter_inner, convg_check=convg_check, grad_control_tol=grad_control_tol, tau_lr_mult=tau_lr_mult,
                                     corr_init_method=rho_init)
 
-        # Random restarts: refit from different log-τ² and rho inits, keep lowest REML.
+        # Random restarts: refit from different log-τ² and rho inits, keep the lowest loss.
+        # log-τ² ~ U(-2, 4) covers τ² from ~0.1 to ~55; rho_raw ~ U(-3, 3) covers rho ~0.05 to ~0.95,
+        # breaking the rho→1 saturation trap.
         if n_restarts > 1:
-            def _save():
-                s = dict(
-                    sigma2=self.lmm.sigma2.clone(), beta=self.lmm.beta.clone(),
-                    D=self.lmm.D.clone(), tuning_params=self.lmm.tuning_params.clone(),
-                    final_loss=self.lmm.final_loss, convg=self.lmm.convg,
-                    n_iter=self.lmm.n_iter,
-                    spline_params=self.lmm.spline_params.detach().clone(),
-                    D_params=self.lmm.D_params.detach().clone(),
-                )
-                if hasattr(self.lmm, 'rho_raw'):
-                    s['rho_raw'] = self.lmm.rho_raw.detach().clone()
-                return s
-            def _restore(s):
-                self.lmm.sigma2 = s['sigma2']; self.lmm.beta = s['beta']
-                self.lmm.D = s['D']; self.lmm.tuning_params = s['tuning_params']
-                self.lmm.final_loss = s['final_loss']; self.lmm.convg = s['convg']
-                self.lmm.n_iter = s['n_iter']
-                with torch.no_grad():
-                    self.lmm.spline_params.copy_(s['spline_params'])
-                    self.lmm.D_params.copy_(s['D_params'])
-                    if 'rho_raw' in s and hasattr(self.lmm, 'rho_raw'):
-                        self.lmm.rho_raw.copy_(s['rho_raw'])
-
-            best = _save()
+            best = copy.deepcopy(self.lmm)
             for k in range(1, n_restarts):
-                # log-τ² ~ U(-2, 4) covers τ² from ~0.1 to ~55; rho_raw ~ U(-3, 3)
-                # covers rho ~0.05 to ~0.95, breaking the rho→1 saturation trap.
-                self.lmm.reset_params(OLS=False)
-                with torch.no_grad():
-                    self.lmm.spline_params.data.uniform_(-2.0, 4.0)
-                    if hasattr(self.lmm, 'rho_raw'):
-                        self.lmm.rho_raw.data.uniform_(-3.0, 3.0)
+                init = dict(spline_params=torch.empty_like(best.spline_params).uniform_(-2.0, 4.0))
+                if hasattr(best, 'rho_raw'):
+                    init['rho_raw'] = torch.empty_like(best.rho_raw).uniform_(-3.0, 3.0)
                 self.lmm.fit_likelihood(
                     lr=lr, max_iter=max_iter, tol=tol, verbose=False,
                     optimizer=optimizer, fit_type=fit_type, warm_start=False,
                     max_iter_inner=max_iter_inner, convg_check=convg_check,
-                    grad_control_tol=grad_control_tol, tau_lr_mult=tau_lr_mult,
+                    grad_control_tol=grad_control_tol, tau_lr_mult=tau_lr_mult, init=init,
                 )
-                if self.lmm.final_loss < best['final_loss']:
+                if self.lmm.final_loss < best.final_loss:
                     if verbose:
-                        print(f"  restart {k}: new best REML = {self.lmm.final_loss:.4f} "
-                              f"(prev {best['final_loss']:.4f})")
-                    best = _save()
-            _restore(best)
+                        print(f"  restart {k}: new best loss = {self.lmm.final_loss:.4f} "
+                              f"(prev {best.final_loss:.4f})")
+                    best = copy.deepcopy(self.lmm)
+            self.lmm = best
 
         self.sigma2 = self.lmm.sigma2.detach()
         self.resid_cov = self.sigma2 * self.lmm.resid_corr().detach()
@@ -235,7 +231,6 @@ class SmoothingSplineMixed(SmoothingSpline):
         return self.lmm
 
     def grouped_nb_to_NxK(self, NB_grouped):
-        # [G, nmax, K] -> [N, K]
         N = self.obs_id.shape[0]
         K = NB_grouped.shape[2]
 
@@ -269,27 +264,20 @@ class SmoothingSplineMixed(SmoothingSpline):
         N = self.y.shape[0]
 
         lmm  = self.lmm
-        fidx = self.obs_flat_idx.to(device)                               # [G, nmax]
+        fidx = self.obs_flat_idx.to(device)
         f64  = torch.float64
         nm, Ktot = lmm.nmax, lmm.K_tot
 
-        r_flat    = self.y.reshape(-1) - (self.X_fit @ self.beta).reshape(-1)  # (N,)
-        r_grouped = (r_flat[fidx] * lmm.mask).to(f64)                     # [G, nmax]
-
-        mask_vec = lmm.mask.unsqueeze(-1)
-        mask_mat = mask_vec @ mask_vec.transpose(1, 2)
-        ZDZ_g    = (lmm.masked_Z @ self.D @ lmm.masked_Z.transpose(-1, -2)).to(f64)
+        r_flat    = self.y.reshape(-1) - (self.X_fit @ self.beta).reshape(-1)
+        r_grouped = (r_flat[fidx] * lmm.mask)
 
         # B = σ²R + ZDZ (no smooth); the smooth is a global low-rank term, so the
         # BLUP â = M⁻¹ UᵀB⁻¹r with M = Λ⁻¹ + UᵀB⁻¹U (Woodbury), shared across subjects.
-        B = (self.sigma2 * lmm.resid_corr().unsqueeze(0) + ZDZ_g) * mask_mat \
-            + (1.0 - mask_mat) * lmm.eye_nmax * 1e6
-        B = 0.5 * (B + B.transpose(-1, -2))
-        L_B = torch.linalg.cholesky(B)
+        L_B = torch.linalg.cholesky(lmm._group_cov(self.sigma2 * lmm.resid_corr(), self.D))
 
-        U     = lmm.U_grouped.to(f64)                                     # [G, nmax, Ktot]
+        U     = lmm.U_grouped
         BiU   = torch.cholesky_solve(U, L_B)
-        Bir   = torch.cholesky_solve(r_grouped.unsqueeze(-1), L_B)        # [G, nmax, 1]
+        Bir   = torch.cholesky_solve(r_grouped.unsqueeze(-1), L_B)
         Um    = U.reshape(G * nm, Ktot)
         A_UU  = Um.transpose(0, 1) @ BiU.reshape(G * nm, Ktot)
         UtBir = Um.transpose(0, 1) @ Bir.reshape(G * nm, 1)
@@ -297,8 +285,8 @@ class SmoothingSplineMixed(SmoothingSpline):
         lam   = self._lam()
         M     = A_UU + torch.diag(1.0 / lam)
         M     = 0.5 * (M + M.transpose(0, 1))
-        L_M   = torch.linalg.cholesky(M + 1e-10 * torch.eye(Ktot, device=device, dtype=f64))
-        a_hat = torch.cholesky_solve(UtBir, L_M).squeeze(-1)              # [Ktot] = E[a|y]
+        L_M, _ = self.lmm._robust_cholesky(M)
+        a_hat = torch.cholesky_solve(UtBir, L_M).squeeze(-1)              # E[a|y]
         self._a_hat = a_hat.detach()
 
         offsets = [0]
@@ -309,9 +297,9 @@ class SmoothingSplineMixed(SmoothingSpline):
         for c in colset:
             a_c    = a_hat[offsets[c]:offsets[c + 1]]
             Xeval  = torch.sort(self.unique_spline_vec[c].to(device))[0]
-            smooth = self.B_list[c].to(device).to(f64) @ a_c
+            smooth = self.B_list[c].to(device) @ a_c
             slope_idx = self.spline_linear_col_idx[c]
-            center_c  = self.spline_linear_center[c].to(device=device, dtype=f64)
+            center_c  = self.spline_linear_center[c]
             if c == 0:
                 linear = self.beta[int(slope_idx)] * (Xeval - center_c) + self.beta[self.px].squeeze()
             else:
@@ -329,13 +317,13 @@ class SmoothingSplineMixed(SmoothingSpline):
 
         if random_effects:
             # V⁻¹r = B⁻¹r − B⁻¹U â
-            Vinv_r = Bir.squeeze(-1) - (BiU @ a_hat.unsqueeze(-1)).squeeze(-1)  # [G, nmax]
+            Vinv_r = Bir.squeeze(-1) - (BiU @ a_hat.unsqueeze(-1)).squeeze(-1)
             w = torch.zeros(N, device=device, dtype=f64)
             w.index_put_((fidx[lmm.mask.bool()],), Vinv_r[lmm.mask.bool()])
-            Zw    = self.Z.to(f64) * w.unsqueeze(1)
+            Zw    = self.Z * w.unsqueeze(1)
             b_hat = torch.zeros((G, self.pz), device=device, dtype=f64)
             b_hat.index_add_(0, inv, Zw)
-            b_hat = (self.D.to(f64) @ b_hat.T).T
+            b_hat = (self.D @ b_hat.T).T
             self.rand_effects = b_hat.detach()
         else:
             self.rand_effects = None
@@ -346,19 +334,8 @@ class SmoothingSplineMixed(SmoothingSpline):
         """Prior variances of the spline coefficients, floored at sigma^2 * exp(-20), the lower
         bound the fit uses, so 1/lam stays finite when a smooth is exactly linear."""
         floor = float(self.sigma2) * float(np.exp(-20.0))
-        tau = self.tau_sq_list.to(torch.float64).clamp(min=floor)
+        tau = self.tau_sq_list.clamp(min=floor)
         return torch.repeat_interleave(tau, self.lmm._K_repeats)
-
-    @staticmethod
-    def _chol_retry(H, n_tries=12):
-        """Cholesky of H, adding growing diagonal jitter (relative to mean(diag H)) if H is numerically singular."""
-        eye, scale, jit = torch.eye(H.shape[0], dtype=H.dtype, device=H.device), H.diagonal().mean(), 0.0
-        for _ in range(n_tries):
-            L, info = torch.linalg.cholesky_ex(H + jit * eye)
-            if int(info) == 0:
-                return L
-            jit = scale * 1e-12 if jit == 0.0 else jit * 10.0
-        return torch.linalg.cholesky(H + jit * eye)
 
     def _posterior_precision(self):
         """Posterior precision H of (beta, a) given the REML variance components, and the
@@ -366,16 +343,10 @@ class SmoothingSplineMixed(SmoothingSpline):
         f64 = torch.float64
         lmm = self.lmm
         G, nm, K, p = lmm.n_groups, lmm.nmax, lmm.K_tot, self.X_fit.shape[1]
-        mask = lmm.mask.unsqueeze(-1)
-        mask2 = mask @ mask.transpose(1, 2)
+        L0 = torch.linalg.cholesky(lmm._group_cov(self.sigma2 * lmm.resid_corr(), self.D))
 
-        ZDZ = (lmm.masked_Z @ self.D @ lmm.masked_Z.transpose(-1, -2)).to(f64)
-        V0 = (self.sigma2 * lmm.resid_corr().unsqueeze(0) + ZDZ) * mask2 \
-             + (1.0 - mask2) * lmm.eye_nmax * 1e6
-        L0 = torch.linalg.cholesky(0.5 * (V0 + V0.transpose(-1, -2)))
-
-        X = (lmm.X_grouped * mask).to(f64)
-        U = lmm.U_grouped.to(f64)
+        X = lmm.X_grouped * lmm.mask.unsqueeze(-1)
+        U = lmm.U_grouped
         ViX = torch.cholesky_solve(X, L0).reshape(G * nm, p)
         ViU = torch.cholesky_solve(U, L0).reshape(G * nm, K)
         X, U = X.reshape(G * nm, p), U.reshape(G * nm, K)
@@ -386,7 +357,20 @@ class SmoothingSplineMixed(SmoothingSpline):
         H[p:, :p] = U.T @ ViX
         H[:p, p:] = H[p:, :p].T
         H[p:, p:] = U.T @ ViU + torch.diag(1.0 / lam)
-        return 0.5 * (H + H.T) + 1e-10 * torch.eye(p + K, dtype=f64, device=self.device), lam
+        return 0.5 * (H + H.T), lam
+
+    def _smooth_design(self, c, idx=None, intercept=True):
+        """Rows mapping the stacked coefficients [X_fit columns; a] to f_c at the sorted knots
+        unique_spline_vec[c][idx] (all knots by default). Smooth 0 carries the intercept."""
+        p, off = self.X_fit.shape[1], np.cumsum([0] + list(self.lmm.K_list))
+        u = self.unique_spline_vec[c]
+        idx = torch.arange(u.numel(), device=u.device) if idx is None else idx
+        E = torch.zeros(idx.numel(), p + self.lmm.K_tot, dtype=u.dtype, device=self.device)
+        E[:, int(self.spline_linear_col_idx[c])] = u[idx] - self.spline_linear_center[c]
+        if intercept and c == 0:
+            E[:, self.px] = 1.0
+        E[:, p + off[c]: p + off[c + 1]] = self.B_list[c][idx]
+        return E
 
     def posterior_moments(self):
         """(mu, H): posterior mean [beta; a] of length p + K_tot and its precision H, so
@@ -395,14 +379,13 @@ class SmoothingSplineMixed(SmoothingSpline):
             raise ValueError("Model not fitted yet.")
         self.get_blup(random_effects=False)
         H, _ = self._posterior_precision()
-        return torch.cat([self.beta.reshape(-1).to(torch.float64), self._a_hat]), H
+        return torch.cat([self.beta.reshape(-1), self._a_hat]), H
 
     def smooth_sum_confint(self, ids, weights=None, alpha=0.05, with_mean=False):
         """Pointwise band for sum_c w_c f_c(x) on the x values shared by the smooths in ids,
         using their joint posterior covariance (e.g. ids=[0, 1] for f_ref + delta). Smooth 0
         carries the intercept; with_mean=False centers the curve over the grid."""
         from scipy.stats import norm
-        f64, dev = torch.float64, self.device
         ids = list(ids)
         w = np.ones(len(ids)) if weights is None else np.asarray(weights, float)
         grid = self.unique_spline_vec[ids[0]]
@@ -411,17 +394,9 @@ class SmoothingSplineMixed(SmoothingSpline):
         if grid.numel() == 0:
             raise ValueError("The smooths share no x values.")
         mu, H = self.posterior_moments()
-        L_H = self._chol_retry(H)
-        p, Ktot = self.X_fit.shape[1], self.lmm.K_tot
-        off = np.cumsum([0] + list(self.lmm.K_list))
-        E = torch.zeros(grid.numel(), p + Ktot, dtype=f64, device=dev)
-        for c, wc in zip(ids, w):
-            u = self.unique_spline_vec[c]
-            idx = torch.searchsorted(u, grid)
-            E[:, int(self.spline_linear_col_idx[c])] += wc * (grid.to(f64) - self.spline_linear_center[c].to(device=dev, dtype=f64))
-            if c == 0:
-                E[:, self.px] += wc
-            E[:, p + off[c]: p + off[c + 1]] += wc * self.B_list[c].to(dev).to(f64)[idx]
+        L_H, _ = self.lmm._robust_cholesky(H)
+        E = sum(wc * self._smooth_design(c, torch.searchsorted(self.unique_spline_vec[c], grid))
+                for c, wc in zip(ids, w))
         if not with_mean:
             E = E - E.mean(0, keepdim=True)
         fit = (E @ mu).detach().cpu().numpy()
@@ -436,17 +411,17 @@ class SmoothingSplineMixed(SmoothingSpline):
         if not hasattr(self, "beta"):
             raise ValueError("Model not fitted yet.")
         self.get_blup(random_effects=conditional)
-        f64, dev = torch.float64, self.device
+        dev = self.device
         off = np.cumsum([0] + list(self.lmm.K_list))
-        fit = (self.X_fit.to(f64) @ self.beta.to(f64)).reshape(-1)
+        fit = (self.X_fit @ self.beta).reshape(-1)
         for c in range(self.spline_inputs.shape[1]):
             u = self.unique_spline_vec[c]
             idx = torch.searchsorted(u, self.spline_inputs[:, c].contiguous()).clamp(max=u.numel() - 1)
-            sm = self.B_list[c].to(dev).to(f64)[idx] @ self._a_hat[off[c]:off[c + 1]]
-            fit = fit + (sm if self.smooth_mask is None else self.smooth_mask[:, c].to(f64) * sm)
+            sm = self.B_list[c].to(dev)[idx] @ self._a_hat[off[c]:off[c + 1]]
+            fit = fit + (sm if self.smooth_mask is None else self.smooth_mask[:, c] * sm)
         if conditional:
             _, inv = torch.unique(self.obs_id.to(dev), sorted=True, return_inverse=True)
-            fit = fit + (self.Z.to(f64) * self.rand_effects[inv]).sum(1)
+            fit = fit + (self.Z * self.rand_effects[inv]).sum(1)
         return fit.detach().cpu().numpy()
 
     def residuals(self, conditional=True):
@@ -462,31 +437,19 @@ class SmoothingSplineMixed(SmoothingSpline):
         if not hasattr(self, "beta"):
             raise ValueError("Model not fitted yet.")
         from scipy.stats import norm
-        device, f64 = self.device, torch.float64
         z = float(norm.ppf(1.0 - alpha / 2.0)) if z is None else z
 
-        lmm = self.lmm
-        p, Ktot = self.X_fit.shape[1], lmm.K_tot
         H, _ = self._posterior_precision()
-        L_H = self._chol_retry(H)
+        L_H, _ = self.lmm._robust_cholesky(H)
 
         self.get_blup(col_smooth=col_smooth, random_effects=False)
         fdf = self.fitted_df
 
-        offsets = [0]
-        for k in lmm.K_list:
-            offsets.append(offsets[-1] + k)
         colset = [col_smooth] if col_smooth is not None else range(self.spline_inputs.shape[1])
 
         out = []
         for c in colset:
-            Xeval = torch.sort(self.unique_spline_vec[c].to(device))[0].to(f64)
-            E = torch.zeros(Xeval.numel(), p + Ktot, dtype=f64, device=device)
-            E[:, int(self.spline_linear_col_idx[c])] = \
-                Xeval - self.spline_linear_center[c].to(device=device, dtype=f64)
-            if c == 0:
-                E[:, self.px] = 1.0
-            E[:, p + offsets[c]: p + offsets[c + 1]] = self.B_list[c].to(device).to(f64)
+            E = self._smooth_design(c)
             sub = fdf[fdf["spline_id"] == c].copy()
             if not with_mean:
                 E = E - E.mean(0, keepdim=True)
@@ -500,7 +463,7 @@ class SmoothingSplineMixed(SmoothingSpline):
         self.confint_df = pd.concat(out, ignore_index=True)
         return self.confint_df
 
-    def fixed_t_test(self, l=None, alpha=0.05, fixed_only=True):
+    def fixed_t_test(self, l=None, fixed_only=True):
         """Satterthwaite t-test for fixed effects, delegated to the fitted self.lmm.
 
         fixed_only (default True): the l=None table covers only the first px columns
@@ -509,7 +472,7 @@ class SmoothingSplineMixed(SmoothingSpline):
         """
         if not hasattr(self, "lmm"):
             raise ValueError("Model not fitted yet.")
-        res = self.lmm.fixed_t_test(l=l, alpha=alpha)
+        res = self.lmm.fixed_t_test(l=l)
         if l is None and fixed_only:
             res = [row for row in res if row["coef"] < self.px]
         return res
@@ -533,9 +496,7 @@ class SmoothingSplineMixed(SmoothingSpline):
         cols = torch.cat([torch.tensor([int(self.spline_linear_col_idx[c])], device=dev),
                           torch.arange(p + off[c], p + off[c + 1], device=dev)])
 
-        x = torch.sort(self.unique_spline_vec[c].to(dev))[0].to(f64)
-        E = torch.cat([(x - self.spline_linear_center[c].to(device=dev, dtype=f64)).unsqueeze(1),
-                       self.B_list[c].to(dev).to(f64)], dim=1)
+        E = self._smooth_design(c, intercept=False)[:, cols]
 
         Hinv = torch.cholesky_solve(torch.eye(p + K, dtype=f64, device=dev), L_H)
         pen = torch.cat([torch.zeros(p, dtype=f64, device=dev), 1.0 / lam])
@@ -545,7 +506,7 @@ class SmoothingSplineMixed(SmoothingSpline):
         M = R @ Hinv[cols][:, cols] @ R.T
         f = torch.as_tensor(fitted["theta_fitted"].to_numpy().copy(), dtype=f64, device=dev)
         if c == 0:
-            f = f - self.beta[self.px].reshape(()).to(f64)
+            f = f - self.beta[self.px].reshape(())
         w = Q.T @ f
 
         ev, V = torch.linalg.eigh(0.5 * (M + M.T))
@@ -563,12 +524,12 @@ class SmoothingSplineMixed(SmoothingSpline):
             raise ValueError("Model not fitted yet.")
         from scipy import stats
         H, lam = self._posterior_precision()
-        L_H = self._chol_retry(H)
+        L_H, _ = self.lmm._robust_cholesky(H)
         fdf = self.get_blup(random_effects=False)[0]
 
         rows = []
         for c in (range(self.spline_inputs.shape[1]) if s is None else [s]):
-            lin = self.lmm.fixed_t_test(l=int(self.spline_linear_col_idx[c]), alpha=alpha)
+            lin = self.lmm.fixed_t_test(l=int(self.spline_linear_col_idx[c]))
             nonlin = self.lmm.linearity_test(s=c, alpha=alpha, null_fit_kwargs=null_fit_kwargs)
             stat = -2.0 * np.log(np.maximum([lin["p_value"], nonlin["p_value"]], 1e-300)).sum()
             p_fisher = float(stats.chi2.sf(stat, 4))
@@ -600,3 +561,20 @@ class SmoothingSplineMixed(SmoothingSpline):
         tests = self.spline_effect_test(alpha=alpha, null_fit_kwargs=null_fit_kwargs)
         tests.insert(1, "term", [f"s({sp[c]})" for c in tests["spline_id"]])
         return SummaryResult(coefficients=coefs, variance=var, splines=tests)
+
+
+class SmoothingSpline(SmoothingSplineMixed):
+    """One penalized curve, no grouping: SmoothingSplineMixed with a single group and no random effects.
+    X and Z default to zero columns, obs_id to one group."""
+
+    def __init__(self, y, X=None, Z=None, spline_inputs=None, obs_id=None, device=None, corr_structure='iid',
+                 rand_D_type='diagonal', rand_D_estimate='sample'):
+        N = len(y)
+        super().__init__(y=y, X=np.zeros((N, 0)) if X is None else X, Z=np.zeros((N, 0)) if Z is None else Z,
+                         spline_inputs=spline_inputs, obs_id=np.zeros(N) if obs_id is None else obs_id,
+                         device=device, corr_structure=corr_structure, rand_D_type=rand_D_type,
+                         rand_D_estimate=rand_D_estimate)
+
+    def get_fitted_theta(self, col=0):
+        """Fitted curve at the distinct x values: DataFrame with spline_var and theta_fitted."""
+        return self.get_blup(col_smooth=col, random_effects=False)[0]

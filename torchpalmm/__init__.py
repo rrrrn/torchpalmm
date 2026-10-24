@@ -4,8 +4,7 @@ __version__ = "0.1.0"
 
 from .linear_mixed_model import LinearMixedModel, lrt_test
 from .linear_mixed_model_smoothing import LinearMixedModelSmoothing
-from .smooth_spline import SmoothingSpline
-from .smooth_spline_mixed import SmoothingSplineMixed
+from .smooth_spline_mixed import SmoothingSpline, SmoothingSplineMixed
 
 __all__ = [
     "LinearMixedModel",
