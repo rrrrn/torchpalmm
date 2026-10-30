@@ -1,6 +1,6 @@
 import warnings
 import torch
-from .linear_mixed_model import LinearMixedModel
+from .linear_mixed_model import FitLog, LinearMixedModel
 def _checktensor(x, dtype = torch.float64):
     if torch.is_tensor(x):
         return x.to(dtype=dtype)
@@ -354,6 +354,11 @@ class LinearMixedModelSmoothing(LinearMixedModel):
             raise ValueError("Invalid convergence check method.")
         return convg_criteria, current_loss, current_sigma2, current_D, current_spline_param, beta_, rel_change, beta_change, D_change, sigma2_change
 
+    def _header_rows(self):
+        rows = super()._header_rows()
+        rows[-1] = ("residual", self._corr_kind())
+        return rows + [("smooths", f"S = {self.len_spline}, K = {', '.join(map(str, self.K_list))}")]
+
     def fit_likelihood(self, optimizer=torch.optim.Adam, lr=1e-3, max_iter=1000, fit_type="REML",
                        tol=1e-6, warm_start=True, verbose=False, convg_check="loss",
                        max_iter_inner=10, tau_lr_mult=5.0, grad_control_tol=1e-2,
@@ -371,6 +376,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                            Catches the case where the loss has genuinely converged but
                            gradient noise keeps grad_norm from ever clearing grad_control_tol.
         """
+        log = FitLog(verbose)
         beta, sigma2 = self.reset_params(OLS=warm_start, estimate=self.rand_D_estimate,
                                          corr_init_method=corr_init_method)
         if init is not None:
@@ -379,8 +385,8 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                     getattr(self, name).copy_(val)
 
         self.fit_type = fit_type
-        if verbose:
-            print("OLS beta:", beta.T)
+        if log.on:
+            self._log_header(log, fit_type, beta, warm_start)
 
         if not (len(self.y_) == len(self.X_) == len(self.Z_)):
             raise ValueError("Incompatible shapes: y, X, and Z must have the same length.")
@@ -395,8 +401,8 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         prev_loss         = float("inf")
 
         if optimizer != torch.optim.LBFGS:
-            if verbose:
-                print(f"Using {optimizer.__name__} with tau_lr_mult={tau_lr_mult}")
+            log.table(f"AdamW: lr={lr:g} (x{tau_lr_mult:g} for tau), {max_iter} steps, "
+                      f"tol={tol:g} on {convg_check}", "step", "rel_loss")
             # τ gets a higher lr (faster convergence) and lower β₂ (quicker forgetting).
             opt_groups = [
                 {'params': [self.spline_params], 'lr': lr * tau_lr_mult, 'betas': (0.9, 0.99)},
@@ -413,6 +419,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                     loss_function, opt, fit_type, tol, convg_check, prev_beta, prev_D, prev_sigma2, prev_loss,
                     grad_control_tol=grad_control_tol,
                 )
+                log.row(step, current_loss, rel_change)
                 if convg_criteria == 1:
                     convg = 1
                     break
@@ -421,12 +428,11 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                 prev_beta         = current_beta.clone().detach()
                 prev_D            = current_D.detach()
                 prev_sigma2       = current_sigma2.detach()
-                if step % 10 == 0 and verbose:
-                    print(f"Step {step}, loss = {current_loss:.6f}, rel_change = {rel_change:.6f}")
 
             # The Adam path profiles beta out analytically (REML and ML); expose the cached value.
             self.beta_ = current_beta
 
+            log.done(convg, step, current_loss)
             if convg == 0:
                 warnings.warn("LinearMixedModelSmoothing: Adam did not converge in "
                               f"{max_iter} steps.")
@@ -435,8 +441,8 @@ class LinearMixedModelSmoothing(LinearMixedModel):
             if max_iter_inner is None:
                 max_iter_inner = 10
             max_iter_outer = max_iter // max_iter_inner
-            if verbose:
-                print(f"LBFGS: {max_iter_outer} outer epochs, {max_iter_inner} inner steps, tau_lr_mult={tau_lr_mult}")
+            log.table(f"LBFGS: lr={lr:g}, {max_iter_outer} epochs x {max_iter_inner} inner steps, "
+                      f"tol={tol:g} on {convg_check}", "epoch", "rel_loss", "rel_param", "grad_norm")
 
             # Joint LBFGS over D_params + spline_params: τ sees the same second-order
             # curvature as D, not just 1 Adam step per outer epoch.
@@ -510,9 +516,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                 prev_D            = current_D.detach()
                 prev_sigma2       = current_sigma2.detach()
                 prev_spline_param = current_spline_param.detach()
-
-                if verbose and (epoch % 10 == 0 or convg == 1):
-                    print(f"LBFGS: Epoch {epoch}, loss = {current_loss:.6f}, grad_norm = {grad_norm:.3e}, rel_loss = {rel_loss:.6f}, rel_param = {rel_param:.6f}")
+                log.row(epoch, current_loss, rel_loss, rel_param, grad_norm)
 
                 if convg_check == "loss":
                     plateau = plateau + 1 if rel_loss < tol else 0
@@ -531,10 +535,9 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                     raise ValueError("Invalid convergence check method.")
 
                 if convg == 1:
-                    if verbose:
-                        print(f"LBFGS converged at epoch {epoch}, loss = {current_loss:.6f}")
                     break
 
+            log.done(convg, epoch, current_loss)
             if convg == 0:
                 warnings.warn(f"LinearMixedModelSmoothing: LBFGS did not converge in "
                               f"{max_iter_outer} epochs (rel_loss={rel_loss:.2e}, grad_norm={grad_norm:.2e}).")

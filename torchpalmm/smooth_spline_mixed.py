@@ -187,7 +187,7 @@ class SmoothingSplineMixed:
 
     def fit(self, warm_start=True, lr=1e-3, max_iter=1000, optimizer=torch.optim.Adam,
         tol=1e-6, max_iter_inner=10, convg_check="loss", fit_type="reml", grad_control_tol=1e-2,
-        tau_lr_mult=5.0, verbose=True, n_restarts=1, rho_init="moment"):
+        tau_lr_mult=5.0, verbose=False, n_restarts=1, rho_init="moment"):
         self.lmm = LinearMixedModelSmoothing(device=self.device, y=self.y, X=self.X_fit, Z=self.Z,
                                             spline_inputs=self.NB_list,
                                             id=self.obs_id, corr_structure=self.corr_structure, rand_D_type=self.rand_D_type, rand_D_estimate=self.rand_D_estimate)
@@ -199,7 +199,9 @@ class SmoothingSplineMixed:
         # log-τ² ~ U(-2, 4) covers τ² from ~0.1 to ~55; rho_raw ~ U(-3, 3) covers rho ~0.05 to ~0.95,
         # breaking the rho→1 saturation trap.
         if n_restarts > 1:
-            best = copy.deepcopy(self.lmm)
+            if verbose:
+                print(f"\n  random restarts ({n_restarts - 1})\n  {'restart':>7}  {'loss':>15}  converged")
+            best, best_k = copy.deepcopy(self.lmm), 0
             for k in range(1, n_restarts):
                 init = dict(spline_params=torch.empty_like(best.spline_params).uniform_(-2.0, 4.0))
                 if hasattr(best, 'rho_raw'):
@@ -210,12 +212,16 @@ class SmoothingSplineMixed:
                     max_iter_inner=max_iter_inner, convg_check=convg_check,
                     grad_control_tol=grad_control_tol, tau_lr_mult=tau_lr_mult, init=init,
                 )
-                if self.lmm.final_loss < best.final_loss:
-                    if verbose:
-                        print(f"  restart {k}: new best loss = {self.lmm.final_loss:.4f} "
-                              f"(prev {best.final_loss:.4f})")
-                    best = copy.deepcopy(self.lmm)
+                better = self.lmm.final_loss < best.final_loss
+                if verbose:
+                    print(f"  {k:7d}  {self.lmm.final_loss:15.6f}  {'yes' if self.lmm.convg else 'no':>9}"
+                          + ("  new best" if better else ""))
+                if better:
+                    best, best_k = copy.deepcopy(self.lmm), k
             self.lmm = best
+            if verbose:
+                print(f"  kept {'the initial fit' if best_k == 0 else f'restart {best_k}'}: "
+                      f"loss = {best.final_loss:.6f}")
 
         self.sigma2 = self.lmm.sigma2.detach()
         self.resid_cov = self.sigma2 * self.lmm.resid_corr().detach()

@@ -1,3 +1,5 @@
+import math
+import time
 import warnings
 import pandas as pd
 import torch
@@ -21,6 +23,49 @@ class SummaryResult(dict):
 
     def _repr_pretty_(self, p, cycle):
         p.text(self._text())
+
+
+class FitLog:
+    """verbose=True fit output: a header, an iteration table (every `every` iterations plus
+    the last one) and a status line. Every method is a no-op when verbose is False."""
+
+    def __init__(self, verbose, every=10):
+        self.on, self.every = bool(verbose), every
+        self._t0 = time.perf_counter()
+        self._last = self._shown = None
+
+    @staticmethod
+    def vec(v, k=6):
+        v = torch.as_tensor(v).reshape(-1).tolist()
+        return "[" + ", ".join(f"{x:.4g}" for x in v[:k]) + (", ..." if len(v) > k else "") + "]"
+
+    def header(self, title, rows):
+        if self.on:
+            w = max(len(k) for k, _ in rows)
+            print("\n".join([title] + [f"  {k:<{w}}  {v}" for k, v in rows]))
+
+    def table(self, optimizer, unit, *cols):
+        self.unit = unit
+        if self.on:
+            print(f"\n  {optimizer}\n  {unit:>5}  {'loss':>15}" + "".join(f"  {c:>10}" for c in cols))
+
+    def row(self, it, loss, *vals):
+        self._last = (it, loss, vals)
+        if self.on and it % self.every == 0:
+            self._print(*self._last)
+
+    def _print(self, it, loss, vals):
+        cells = "".join(f"  {v:10.2e}" if math.isfinite(v) else f"  {'-':>10}" for v in vals)
+        print(f"  {it:5d}  {loss:15.6f}{cells}")
+        self._shown = it
+
+    def done(self, converged, it, loss):
+        if not self.on:
+            return
+        if self._last is not None and self._shown != self._last[0]:
+            self._print(*self._last)
+        status = f"converged at {self.unit} {it}" if converged else f"not converged, stopped at {self.unit} {it}"
+        print(f"  {status}: loss = {loss:.6f} ({time.perf_counter() - self._t0:.2f} s)")
 
 
 class LinearMixedModel:
@@ -447,6 +492,20 @@ class LinearMixedModel:
             raise ValueError("Invalid convergence check method.")
         return convg_criteria, current_loss, current_sigma2, current_D, beta_, rel_change, beta_change, D_change, sigma2_change
 
+    def _header_rows(self):
+        """Data and model rows of the verbose=True header."""
+        D = f"q = {self.pz}, D {self._structure_kind(self.rand_D_type)}" if self.pz else "none"
+        return [("data", f"{len(self.y_)} obs in {self.n_groups} groups (max {self.nmax} per group)"),
+                ("fixed", f"p = {self.X_.shape[1]}"),
+                ("random", D),
+                ("residual", self._structure_kind(self.corr_structure))]
+
+    def _log_header(self, log, fit_type, beta, warm_start):
+        start = (f"OLS beta = {FitLog.vec(beta)}" if warm_start and self.rand_D_estimate == "sample"
+                 else "default (no warm start)")
+        log.header(f"{type(self).__name__}: {fit_type.upper()} fit",
+                   self._header_rows() + [("start", start)])
+
     def fit_likelihood(self, optimizer = torch.optim.Adam, lr=1e-3, max_iter=1000, fit_type = "REML",
             tol=1e-6, warm_start=True, verbose=False, convg_check = "loss", max_iter_inner=10):
         if not (len(self.y_) == len(self.X_) == len(self.Z_)):
@@ -454,9 +513,10 @@ class LinearMixedModel:
 
         self.fit_type = fit_type
         ml = fit_type.lower() == "ml"
+        log = FitLog(verbose)
         beta, _ = self.reset_params(OLS=warm_start, estimate=self.rand_D_estimate)
-        if verbose:
-            print("OLS beta:", beta.T)
+        if log.on:
+            self._log_header(log, fit_type, beta, warm_start)
 
         loss_function = self.loss_fn if ml else self.loss_fn_reml
         params = [self.L_elements, self.sigma_L]
@@ -464,12 +524,10 @@ class LinearMixedModel:
             self.beta_ = torch.nn.Parameter(beta)
             params.append(self.beta_)
 
-        if verbose:
-            print(f"Using optimizer: {optimizer.__name__}")
         if optimizer == torch.optim.LBFGS:
-            fitted = self._fit_lbfgs(loss_function, params, beta, lr, max_iter, max_iter_inner, tol, convg_check, verbose)
+            fitted = self._fit_lbfgs(loss_function, params, beta, lr, max_iter, max_iter_inner, tol, convg_check, log)
         else:
-            fitted = self._fit_adam(loss_function, params, beta, lr, max_iter, fit_type, tol, convg_check, verbose)
+            fitted = self._fit_adam(loss_function, params, beta, lr, max_iter, fit_type, tol, convg_check, log)
         self.convg, self.final_loss, self.sigma2, self.D, self.n_iter = fitted
 
         self.sigma2 = self.sigma2.clone().detach()
@@ -477,8 +535,9 @@ class LinearMixedModel:
         self.beta = self.beta_.clone().detach()
         return self
 
-    def _fit_adam(self, loss_function, params, beta, lr, max_iter, fit_type, tol, convg_check, verbose):
+    def _fit_adam(self, loss_function, params, beta, lr, max_iter, fit_type, tol, convg_check, log):
         opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
+        log.table(f"AdamW: lr={lr:g}, {max_iter} steps, tol={tol:g} on {convg_check}", "step", "rel_loss")
         prev_beta = beta.clone().detach()
         prev_D = self.param_to_sqmatrix(self.L_elements, n=self.pz, correlation_structure=self.rand_D_type).detach()
         prev_sigma2 = self.param_to_sqmatrix(self.sigma_L, n=self.nmax, correlation_structure=self.corr_structure).detach()
@@ -489,6 +548,7 @@ class LinearMixedModel:
             convg_criteria, current_loss, current_sigma2, current_D, current_beta, rel_change, _, _, _ = self.update_iter(
                 loss_function, opt, fit_type, tol, convg_check, prev_beta, prev_D, prev_sigma2, prev_loss
             )
+            log.row(step, current_loss, rel_change)
             if convg_criteria == 1:
                 convg = 1
                 break
@@ -497,25 +557,21 @@ class LinearMixedModel:
             prev_beta = current_beta.clone().detach()
             prev_D = current_D.detach()
             prev_sigma2 = current_sigma2.detach()
-            if step % 10 == 0 and verbose:
-                print(f"Step {step}, loss = {current_loss:.6f}, relative change = {rel_change:.6f}")
 
         if fit_type.lower() != "ml":
             self.beta_ = current_beta
-        if convg:
-            if verbose:
-                print(f"Converged at step {step}, loss = {current_loss:.6f}")
-        else:
+        log.done(convg, step, current_loss)
+        if not convg:
             warnings.warn(f"LinearMixedModel: Adam did not converge in {max_iter} steps "
                           f"(rel_change={rel_change:.2e}).")
         return convg, current_loss, current_sigma2, current_D, step
 
-    def _fit_lbfgs(self, loss_function, params, beta, lr, max_iter, max_iter_inner, tol, convg_check, verbose):
+    def _fit_lbfgs(self, loss_function, params, beta, lr, max_iter, max_iter_inner, tol, convg_check, log):
         ml = self.fit_type.lower() == "ml"
         max_iter_inner = max_iter_inner or 10
         max_iter_outer = max_iter // max_iter_inner
-        if verbose:
-            print(f"Using LBFGS optimizer with {max_iter_outer} epochs.")
+        log.table(f"LBFGS: lr={lr:g}, {max_iter_outer} epochs x {max_iter_inner} inner steps, "
+                  f"tol={tol:g} on {convg_check}", "epoch", "rel_loss", "rel_param", "grad_norm")
         opt = torch.optim.LBFGS(params, lr=lr, max_iter=max_iter_inner,
                                 history_size=10, line_search_fn="strong_wolfe")
         prev_beta = beta.clone().detach()
@@ -555,16 +611,14 @@ class LinearMixedModel:
             prev_beta = self.beta_.detach()
             prev_D = current_D.detach()
             prev_sigma2 = current_sigma2.detach()
-            if verbose and epoch % 10 == 0:
-                print(f"LBFGS: Epoch {epoch}, loss = {current_loss:.6f}, grad_norm = {grad_norm:.3e}, rel_loss = {rel_loss:.6f}, rel_param = {rel_param:.6f}")
+            log.row(epoch, current_loss, rel_loss, rel_param, grad_norm)
 
             if (rel_loss < tol) or grad_norm < 1e-2:
                 if convg_check not in ["params", "all"] or rel_param < tol:
                     convg = 1
-                if verbose:
-                    print(f"LBFGS converged at epoch {epoch}, grad_norm = {grad_norm:.3e}, rel_loss = {rel_loss:.6f}, rel_param = {rel_param:.6f}")
                 break
 
+        log.done(convg, epoch, current_loss)
         if convg == 0:
             warnings.warn(f"LinearMixedModel: LBFGS did not converge in {max_iter_outer} epochs "
                           f"(rel_loss={rel_loss:.2e}, grad_norm={grad_norm:.2e}).")
