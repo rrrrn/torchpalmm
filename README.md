@@ -70,15 +70,9 @@ For the methodology (model, scalable REML, the linearity score test), see:
 <!-- TODO: link your paper / project page here -->
 - Paper / project: **TODO**
 
-## Public API
+## API reference
 
-| object | purpose |
-|---|---|
-| `LinearMixedModel` | (generalized) linear mixed model, REML/ML |
-| `LinearMixedModelSmoothing` | LMM with global additive smooth components |
-| `SmoothingSpline` | a single penalized smoothing spline (`SmoothingSplineMixed` with one group, no random effects) |
-| `SmoothingSplineMixed` | smoothing-spline mixed model (high-level API); `summary()`, `spline_effect_test()`, `smooth_mask=` |
-| `lrt_test` | likelihood-ratio test between two fitted models |
+Classes, constructor and `fit` arguments, and the post-fit methods are listed in [`API.md`](API.md).
 
 ## Citation
 
