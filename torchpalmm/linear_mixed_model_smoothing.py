@@ -566,6 +566,8 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                 if convg == 1:
                     break
 
+            st = opt_joint.state[opt_joint._params[0]]               # PyTorch's cumulative LBFGS counters
+            self.n_epochs, self.n_lbfgs_steps, self.n_func_evals = epoch + 1, int(st.get('n_iter', 0)), int(st.get('func_evals', 0))
             log.done(convg, epoch, current_loss)
             if convg == 0:
                 warnings.warn(f"LinearMixedModelSmoothing: LBFGS did not converge in "
