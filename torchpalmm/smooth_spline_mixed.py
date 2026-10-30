@@ -515,6 +515,12 @@ class SmoothingSplineMixed:
             raise ValueError("Model not fitted yet.")
         return self.lmm.linearity_test(s=s, alpha=alpha, null_fit_kwargs=null_fit_kwargs)
 
+    def AIC(self):
+        """AIC of the fitted model (see LinearMixedModelSmoothing.AIC)."""
+        if not hasattr(self, "lmm"):
+            raise ValueError("Model not fitted yet.")
+        return self.lmm.AIC()
+
     def _wald_smooth(self, c, fitted, H, L_H, lam):
         """Wood (2013) Wald test of H0: f_c = 0, f_c = slope * (x - center) + B_c a_c, at the
         observed x. Statistic f' V_f^- f with V_f = Cov(f | y) truncated to rank

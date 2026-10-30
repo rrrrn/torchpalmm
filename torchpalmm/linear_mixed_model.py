@@ -347,33 +347,8 @@ class LinearMixedModel:
 
         return beta, sigma2
 
-    def loss_fn(self, sigma2, D, beta = None):
-        if self.beta_ is None and beta is None:
-            raise ValueError("Beta coefficients must be provided either during initialization or as an argument.")
-        if beta is None:
-            beta = self.beta_
-
-        e = self.y_grouped - (self.X_grouped @ beta.to( device=self.device)).squeeze(-1)
-
-        LVi, _ = self._robust_cholesky(self._group_cov(sigma2, D))
-
-        e_exp = e.unsqueeze(-1)
-        Vinv_e = torch.cholesky_solve(e_exp, LVi)
-
-        rVinvr = torch.sum(e_exp.squeeze(-1) * Vinv_e.squeeze(-1), dim=1)
-        rVinvr = torch.sum(rVinvr)
-
-        logdetVi = 2 * torch.sum(torch.log(torch.diagonal(LVi, dim1=1, dim2=2)), dim=1)
-        logdetVsum = torch.sum(logdetVi)
-
-        n_eff = int(self.mask.sum().item())
-        neg_loglik = 0.5 * (logdetVsum + rVinvr + n_eff * torch.log(torch.tensor(2.0 * torch.pi, device=self.device)))
-        return neg_loglik
-
-    def loss_fn_reml(self, sigma2, D):
-        """
-        Returns negative REML log-likelihood.
-        """
+    def _profiled_terms(self, sigma2, D):
+        """(logdet V, r'V^-1 r, logdet X'V^-1 X, n_eff) at the GLS beta_hat(sigma2, D); shared by ML and REML."""
         mask_vec = self.mask.unsqueeze(-1)
         n_eff = int(self.mask.sum().item())
 
@@ -440,14 +415,20 @@ class LinearMixedModel:
 
         rVinv_r = torch.sum(r_exp.squeeze(-1) * Vinv_r.squeeze(-1), dim=1)
         rVinv_r = torch.sum(rVinv_r)
+        return logdetV_sum, rVinv_r, self._logdet_spd(XtVinvX), n_eff
 
-        logdet_XtVinvX = self._logdet_spd(XtVinvX)
+    def loss_fn(self, sigma2, D):
+        """Negative ML log-likelihood, beta profiled out."""
+        logdetV, rVinv_r, _, n_eff = self._profiled_terms(sigma2, D)
+        return 0.5 * (logdetV + rVinv_r + n_eff * math.log(2.0 * math.pi))
+
+    def loss_fn_reml(self, sigma2, D):
+        """Negative REML log-likelihood, beta profiled out."""
+        logdetV, rVinv_r, logdet_XtVinvX, n_eff = self._profiled_terms(sigma2, D)
         p = self.X_.shape[1]
+        return 0.5 * (logdetV + rVinv_r + logdet_XtVinvX + (n_eff - p) * math.log(2.0 * math.pi))
 
-        neg_loglik = 0.5 * (logdetV_sum + rVinv_r + logdet_XtVinvX + (n_eff - p) * torch.log(torch.tensor(2.0 * torch.pi)))
-        return neg_loglik
-
-    def update_iter(self, loss_function, opt, fit_type, tol, convg_check, prev_beta, prev_D, prev_sigma2, prev_loss):
+    def update_iter(self, loss_function, opt, tol, convg_check, prev_beta, prev_D, prev_sigma2, prev_loss):
         sigma2 = self.param_to_sqmatrix(self.sigma_L, n=max(self.lengths_), correlation_structure=self.corr_structure)
         D = self.param_to_sqmatrix(self.L_elements, n=self.pz, correlation_structure=self.rand_D_type)
         opt.zero_grad()
@@ -462,10 +443,7 @@ class LinearMixedModel:
             current_D = D
             current_sigma2 = sigma2
 
-            if fit_type.lower() == "ml":
-                beta_ = self.beta_.detach()   # ML optimizes beta directly
-            else:
-                beta_ = self.beta_hat(sigma2=sigma2, D=D)
+            beta_ = self.beta_hat(sigma2=sigma2, D=D)
 
             eps = 1e-8
             beta_change = torch.max(torch.abs((beta_ - prev_beta) / (prev_beta.abs() + eps))).item()
@@ -509,26 +487,24 @@ class LinearMixedModel:
 
     def fit_likelihood(self, optimizer = torch.optim.Adam, lr=1e-3, max_iter=1000, fit_type = "REML",
             tol=1e-6, warm_start=True, verbose=False, convg_check = "loss", max_iter_inner=10):
+        """fit_type: "REML" (default) or "ML". Only the loss differs; beta is profiled out (GLS) under both."""
         if not (len(self.y_) == len(self.X_) == len(self.Z_)):
             raise ValueError("Incompatible shapes: y, X, and Z must have the same length.")
+        self._check_fit_type(fit_type)
 
         self.fit_type = fit_type
-        ml = fit_type.lower() == "ml"
         log = FitLog(verbose)
         beta, _ = self.reset_params(OLS=warm_start, estimate=self.rand_D_estimate)
         if log.on:
             self._log_header(log, fit_type, beta, warm_start)
 
-        loss_function = self.loss_fn if ml else self.loss_fn_reml
+        loss_function = self.loss_fn if fit_type.lower() == "ml" else self.loss_fn_reml
         params = [self.L_elements, self.sigma_L]
-        if ml:
-            self.beta_ = torch.nn.Parameter(beta)
-            params.append(self.beta_)
 
         if optimizer == torch.optim.LBFGS:
             fitted = self._fit_lbfgs(loss_function, params, beta, lr, max_iter, max_iter_inner, tol, convg_check, log)
         else:
-            fitted = self._fit_adam(loss_function, params, beta, lr, max_iter, fit_type, tol, convg_check, log)
+            fitted = self._fit_adam(loss_function, params, beta, lr, max_iter, tol, convg_check, log)
         self.convg, self.final_loss, self.sigma2, self.D, self.n_iter = fitted
 
         self.sigma2 = self.sigma2.clone().detach()
@@ -536,7 +512,7 @@ class LinearMixedModel:
         self.beta = self.beta_.clone().detach()
         return self
 
-    def _fit_adam(self, loss_function, params, beta, lr, max_iter, fit_type, tol, convg_check, log):
+    def _fit_adam(self, loss_function, params, beta, lr, max_iter, tol, convg_check, log):
         opt = torch.optim.AdamW(params, lr=lr, weight_decay=0.0)
         log.table(f"AdamW: lr={lr:g}, {max_iter} steps, tol={tol:g} on {convg_check}", "step", "rel_loss")
         prev_beta = beta.clone().detach()
@@ -547,7 +523,7 @@ class LinearMixedModel:
         convg = 0
         for step in range(max_iter):
             convg_criteria, current_loss, current_sigma2, current_D, current_beta, rel_change, _, _, _ = self.update_iter(
-                loss_function, opt, fit_type, tol, convg_check, prev_beta, prev_D, prev_sigma2, prev_loss
+                loss_function, opt, tol, convg_check, prev_beta, prev_D, prev_sigma2, prev_loss
             )
             log.row(step, current_loss, rel_change)
             if convg_criteria == 1:
@@ -559,8 +535,7 @@ class LinearMixedModel:
             prev_D = current_D.detach()
             prev_sigma2 = current_sigma2.detach()
 
-        if fit_type.lower() != "ml":
-            self.beta_ = current_beta
+        self.beta_ = current_beta
         log.done(convg, step, current_loss)
         if not convg:
             warnings.warn(f"LinearMixedModel: Adam did not converge in {max_iter} steps "
@@ -568,7 +543,6 @@ class LinearMixedModel:
         return convg, current_loss, current_sigma2, current_D, step
 
     def _fit_lbfgs(self, loss_function, params, beta, lr, max_iter, max_iter_inner, tol, convg_check, log):
-        ml = self.fit_type.lower() == "ml"
         max_iter_inner = max_iter_inner or 10
         max_iter_outer = max_iter // max_iter_inner
         log.table(f"LBFGS: lr={lr:g}, {max_iter_outer} epochs x {max_iter_inner} inner steps, "
@@ -597,8 +571,7 @@ class LinearMixedModel:
             with torch.no_grad():
                 current_sigma2 = self.param_to_sqmatrix(self.sigma_L, n=self.nmax, correlation_structure=self.corr_structure)
                 current_D = self.param_to_sqmatrix(self.L_elements, n=self.pz, correlation_structure=self.rand_D_type)
-                if not ml:
-                    self.beta_ = self.beta_hat(sigma2=current_sigma2, D=current_D).clone().detach()
+                self.beta_ = self.beta_hat(sigma2=current_sigma2, D=current_D).clone().detach()
                 current_loss = total_loss.item()
 
                 eps = 1e-12
@@ -624,6 +597,18 @@ class LinearMixedModel:
             warnings.warn(f"LinearMixedModel: LBFGS did not converge in {max_iter_outer} epochs "
                           f"(rel_loss={rel_loss:.2e}, grad_norm={grad_norm:.2e}).")
         return convg, current_loss, current_sigma2, current_D, epoch
+
+    @staticmethod
+    def _check_fit_type(fit_type):
+        if fit_type.lower() not in ("reml", "ml"):
+            raise ValueError(f'fit_type must be "REML" or "ML", got {fit_type!r}.')
+
+    def _warn_if_ml(self, test):
+        """REML-based score tests refit the null by REML, so they do not use an ML fit."""
+        if getattr(self, "fit_type", "REML").lower() == "ml":
+            warnings.warn(f"{test} is a REML-based score test and refits its null model by REML; "
+                          f"this model was fit by ML. Refit with fit_type='REML' for estimates "
+                          f"consistent with the test.", stacklevel=3)
 
     # --- Hypothesis testing for fixed effects ---
     # Satterthwaite t-test (lmerTest): t = l'b / sqrt(l'C l),
@@ -657,7 +642,7 @@ class LinearMixedModel:
     def nll(self, theta):
         sigma2, D = self.unpack_theta(theta, self.D.shape[0])
         if getattr(self, "fit_type", "REML").lower() == "ml":
-            return self.loss_fn(sigma2, D, beta=self.beta)
+            return self.loss_fn(sigma2, D)
         return self.loss_fn_reml(sigma2, D)
 
     def C_theta(self, theta):
@@ -838,6 +823,7 @@ class LinearMixedModel:
         if q is None:
             return [self.random_effect_test(j, alpha=alpha, null_fit_kwargs=null_fit_kwargs)
                     for j in range(self.pz)]
+        self._warn_if_ml("random_effect_test")
         idx = [q] if isinstance(q, int) else list(q)
         L_V0 = self._random_effect_null_chol(idx, null_fit_kwargs=null_fit_kwargs)
         S_plus, e, info = self._boundary_score(self.masked_Z[:, :, idx], L_V0)
@@ -847,7 +833,7 @@ class LinearMixedModel:
 
     def AIC(self):
         """AIC from the ML log-likelihood at the fitted estimates (use an ML fit for a proper AIC)."""
-        nll_value = self.loss_fn(self.sigma2, self.D, beta=self.beta)
+        nll_value = self.loss_fn(self.sigma2, self.D)
         k = len(self.beta) + self._theta_hat().numel()
         return 2.0 * nll_value.item() + 2.0 * k
 

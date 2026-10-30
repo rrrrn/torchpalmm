@@ -31,7 +31,7 @@
 |---|---|---|
 | `optimizer` | `torch.optim.LBFGS` [11] is recommended | `Adam` |
 | `lr`, `max_iter`, `tol` | step size, iteration cap, convergence tolerance | `1e-3`, `1000`, `1e-6` |
-| `fit_type` | `"reml"` [1] or `"ml"` | `"reml"` |
+| `fit_type` | `"reml"` [1] or `"ml"`; only the loss changes, β is profiled out under both | `"reml"` |
 | `warm_start` | initialize from an OLS fit | `True` |
 | `n_restarts` | extra random restarts, best loss is kept | `1` |
 | `verbose` | print the optimizer log | `False` |
@@ -46,9 +46,12 @@
 | `get_blup()` | fitted smooth components (DataFrame) |
 | `smooth_confint(alpha)`, `smooth_sum_confint(ids, weights)` | pointwise bands for one smooth or a weighted sum of smooths |
 | `fitted_values(conditional)`, `residuals(conditional)` | fitted values and residuals |
+| `AIC()` | AIC from the ML log-likelihood at the fitted estimates (use an ML fit) |
 | `fixed_t_test(l)` | Satterthwaite t-test [2] for a fixed-effect contrast `l` |
 | `linearity_test(s)` | score test, H0: smooth `s` is linear (variance-component score test [6, 7]) |
 | `spline_effect_test(s)` | H0: smooth `s` is zero (Fisher-combined and Wald p-values) |
+
+The score tests (`linearity_test`, `spline_effect_test`, `random_effect_test`) are REML-based: their null model is always refit by REML, and they warn when called on an ML fit. Use ML fits for `lrt_test` on fixed effects.
 
 `LinearMixedModel(y, X, Z, id, corr_structure, rand_D_type)` has the same `fit_likelihood(optimizer, lr, max_iter, fit_type, ...)`, `fixed_t_test`, `coef_table`, `variance_table` and `summary`. Use `help(torchpalmm.SmoothingSplineMixed)` for the docstrings.
 

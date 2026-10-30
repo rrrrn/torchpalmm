@@ -405,6 +405,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                            Catches the case where the loss has genuinely converged but
                            gradient noise keeps grad_norm from ever clearing grad_control_tol.
         """
+        self._check_fit_type(fit_type)
         log = FitLog(verbose)
         beta, sigma2 = self.reset_params(OLS=warm_start, estimate=self.rand_D_estimate,
                                          corr_init_method=corr_init_method)
@@ -620,6 +621,15 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         _, _, _, XtVinvX, _ = self._reml_relative(D, s_params, R)
         return torch.exp(log_s2) * torch.linalg.inv(XtVinvX)
 
+    def AIC(self):
+        """AIC from the ML log-likelihood at the fitted estimates (use an ML fit for a proper AIC)."""
+        n_eff = int(self.mask.sum().item())
+        theta = self._theta_hat()
+        D, s_params, R, log_s2 = self._split_theta(theta)
+        logdetV, _, rVinv_r, _, _ = self._reml_relative(D, s_params, R)
+        nll = 0.5 * (n_eff * (log_s2 + math.log(2.0 * math.pi)) + rVinv_r / torch.exp(log_s2) + logdetV)
+        return 2.0 * nll.item() + 2.0 * (len(self.beta) + theta.numel())
+
     # --- Linearity test for a smooth component (variance-component score test) ---
     # H0: tau_c^2 = 0 (component c is linear) vs H1: tau_c^2 > 0 (nonlinear).
     # Boundary score test (Lin 1997; Zhang & Lin 2003), in closed form in the natural
@@ -678,6 +688,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         if s is None:
             return [self.linearity_test(j, alpha=alpha, null_fit_kwargs=null_fit_kwargs)
                     for j in range(self.len_spline)]
+        self._warn_if_ml("linearity_test")
         L_V0 = self._assemble_null_chol(s, null_fit_kwargs=null_fit_kwargs)
         S_plus, e, info = self._boundary_score(self.NB_list[s] * self.mask.unsqueeze(-1), L_V0)
         out = self._boundary_pvalue(S_plus, e, info)
