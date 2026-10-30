@@ -1,3 +1,4 @@
+import math
 import warnings
 import torch
 from .linear_mixed_model import FitLog, LinearMixedModel
@@ -18,12 +19,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         self.len_spline = len(self.NB_list)
         self.rank_X = torch.linalg.matrix_rank(self.X_)
 
-        # NB_list[s] is [G, nmax, K_s] with K_s varying; NB @ NB.T is [G, nmax, nmax] either way.
         mask_3d = self.mask.unsqueeze(-1)
-        self.NB_NB = torch.stack([
-            (NB * mask_3d) @ (NB * mask_3d).transpose(-1, -2)
-            for NB in self.NB_list
-        ], dim=0)
 
         # Global smooth design U = [NB_1|…|NB_S]; the smooth is one shared
         # random vector per component, handled via Woodbury in the REML loss.
@@ -32,6 +28,17 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         self._K_repeats = torch.tensor(self.K_list, device=self.device)
         self.U_grouped = torch.cat([NB * mask_3d for NB in self.NB_list],
                                    dim=2)
+
+        self._woodbury = self._corr_kind() == "iid" and self.pz < self.nmax
+        if self._woodbury:
+            A = torch.cat([self.masked_X, self.masked_y.unsqueeze(-1), self.U_grouped], dim=2)
+            if self.pz:
+                Q, self._wb_R = torch.linalg.qr(self.masked_Z)
+                self._wb_W = Q.transpose(-1, -2) @ A
+                A -= Q @ self._wb_W
+            A = A.reshape(-1, A.shape[-1])
+            self._wb_base = A.transpose(0, 1) @ A
+            self._wb_pad_logdet = (self.n_groups * self.nmax - self.mask.sum().item()) * math.log(1e6)
 
     # Relative residual structures. Diagonal uses an identified variance-ratio
     # representation because the common residual scale σ² is profiled out.
@@ -209,40 +216,62 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                     torch.ones(1, device=self.device, dtype=self.y_.dtype)
                 )
 
+    def _woodbury_chol(self, D):
+        """Cholesky of T_i = I + R_i D R_i' (pz x pz per group)."""
+        R = self._wb_R
+        T = torch.eye(self.pz, device=self.device, dtype=R.dtype) + R @ D @ R.transpose(-1, -2)
+        return self._robust_cholesky(T)[0]
+
+    def _woodbury_forms(self, D):
+        """(log|B|, [X y U]' B^-1 [X y U]) for iid residuals. With Z_i = Q_i R_i,
+        B_i^-1 = I - Q_i Q_i' + Q_i T_i^-1 Q_i' and |B_i| = |T_i|, T_i = I + R_i D R_i'."""
+        if not self.pz:
+            return self._wb_pad_logdet, self._wb_base
+        L_T = self._woodbury_chol(D)
+        logdetB = 2.0 * torch.log(torch.diagonal(L_T, dim1=-2, dim2=-1)).sum() + self._wb_pad_logdet
+        W = self._wb_W
+        return logdetB, self._wb_base + torch.einsum("gzi,gzj->ij", W, torch.cholesky_solve(W, L_T))
+
     def _reml_relative(self, D, spline_param, R):
         """Relative-scale REML pieces (σ² profiled out). R is the unit-diagonal residual
         correlation. Returns (logdetV, logdet_XtVinvX, rVinv_r, XtVinvX, beta_hat), all in
         relative units (true V = σ²·this). Shared by loss_fn_reml and the fixed-effect test."""
-        G        = self.n_groups
-        nm       = self.nmax
         p        = self.X_.shape[1]
-        Ktot     = self.K_tot
-        mask_vec = self.mask.unsqueeze(-1)
-        X_eff    = (self.X_grouped * mask_vec)
-        y_eff    = (self.y_grouped * mask_vec.squeeze(-1))
-        U_all    = self.U_grouped
 
         # symmetric bound is exp() overflow safety only; a min>0 would trap the gradient at 0.
         tau_sq  = torch.exp(spline_param.clamp(min=-20.0, max=20.0))
         lam     = torch.repeat_interleave(tau_sq, self._K_repeats)
         lam_inv = 1.0 / lam
 
-        L, _ = self._robust_cholesky(self._group_cov(R, D))
-        logdetB = 2.0 * torch.sum(torch.log(torch.diagonal(L, dim1=1, dim2=2)))
+        if self._woodbury:
+            logdetB, A = self._woodbury_forms(D)
+            A_XX, A_Xy, A_yy = A[:p, :p], A[:p, p:p + 1], A[p, p]
+            A_UX, A_Uy, A_UU = A[p + 1:, :p], A[p + 1:, p:p + 1], A[p + 1:, p + 1:]
+        else:
+            G        = self.n_groups
+            nm       = self.nmax
+            Ktot     = self.K_tot
+            mask_vec = self.mask.unsqueeze(-1)
+            X_eff    = (self.X_grouped * mask_vec)
+            y_eff    = (self.y_grouped * mask_vec.squeeze(-1))
+            U_all    = self.U_grouped
 
-        BiX = torch.cholesky_solve(X_eff, L)
-        Biy = torch.cholesky_solve(y_eff.unsqueeze(-1), L)
-        BiU = torch.cholesky_solve(U_all, L)
+            L, _ = self._robust_cholesky(self._group_cov(R, D))
+            logdetB = 2.0 * torch.sum(torch.log(torch.diagonal(L, dim1=1, dim2=2)))
 
-        # Per-group quadratic forms via one matmul over stacked [G*nm, .].
-        Xm, ym, Um    = X_eff.reshape(G * nm, p), y_eff.reshape(G * nm, 1), U_all.reshape(G * nm, Ktot)
-        BiXm, Biym, BiUm = BiX.reshape(G * nm, p), Biy.reshape(G * nm, 1), BiU.reshape(G * nm, Ktot)
-        A_XX = Xm.transpose(0, 1) @ BiXm
-        A_Xy = Xm.transpose(0, 1) @ Biym
-        A_yy = (ym * Biym).sum()
-        A_UX = Um.transpose(0, 1) @ BiXm
-        A_Uy = Um.transpose(0, 1) @ Biym
-        A_UU = Um.transpose(0, 1) @ BiUm
+            BiX = torch.cholesky_solve(X_eff, L)
+            Biy = torch.cholesky_solve(y_eff.unsqueeze(-1), L)
+            BiU = torch.cholesky_solve(U_all, L)
+
+            # Per-group quadratic forms via one matmul over stacked [G*nm, .].
+            Xm, ym, Um    = X_eff.reshape(G * nm, p), y_eff.reshape(G * nm, 1), U_all.reshape(G * nm, Ktot)
+            BiXm, Biym, BiUm = BiX.reshape(G * nm, p), Biy.reshape(G * nm, 1), BiU.reshape(G * nm, Ktot)
+            A_XX = Xm.transpose(0, 1) @ BiXm
+            A_Xy = Xm.transpose(0, 1) @ Biym
+            A_yy = (ym * Biym).sum()
+            A_UX = Um.transpose(0, 1) @ BiXm
+            A_Uy = Um.transpose(0, 1) @ Biym
+            A_UU = Um.transpose(0, 1) @ BiUm
 
         M   = A_UU + torch.diag(lam_inv)
         M   = 0.5 * (M + M.transpose(0, 1))
@@ -620,9 +649,11 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                 rand_D_estimate=self.rand_D_estimate)
             null.fit_likelihood(**nfk)
             D_abs    = null.D
-            resid    = null.sigma2 * null.resid_corr()                       # sigma^2 R
-            smooth   = (self.NB_NB[others]
-                        * null.tuning_params.view(-1, 1, 1, 1)).sum(0)       # sum tau^2 NBNB'
+            resid    = (null.sigma2 * null.resid_corr()).expand(self.n_groups, -1, -1).clone()
+            for j, tau2 in zip(others, null.tuning_params.tolist()):
+                k0  = sum(self.K_list[:j])
+                U_j = self.U_grouped[:, :, k0:k0 + self.K_list[j]]
+                resid.baddbmm_(U_j, U_j.transpose(-1, -2), alpha=tau2)      # += tau^2 NB NB'
         else:
             null = LinearMixedModel(
                 y=y, X=self.X_, Z=self.Z_, id=self.id_,
@@ -632,9 +663,8 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                                 convg_check=nfk["convg_check"], verbose=nfk["verbose"])
             D_abs  = null.D
             resid  = null.sigma2
-            smooth = 0.0
 
-        return self._robust_cholesky(self._group_cov(resid + smooth, D_abs))[0]
+        return self._robust_cholesky(self._group_cov(resid, D_abs))[0]
 
     def linearity_test(self, s=None, alpha=0.05, null_fit_kwargs=None):
         """Score test of H0: smooth component s is linear (tau_s^2 = 0) vs nonlinear,

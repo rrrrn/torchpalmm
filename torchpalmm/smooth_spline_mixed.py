@@ -279,14 +279,20 @@ class SmoothingSplineMixed:
 
         # B = σ²R + ZDZ (no smooth); the smooth is a global low-rank term, so the
         # BLUP â = M⁻¹ UᵀB⁻¹r with M = Λ⁻¹ + UᵀB⁻¹U (Woodbury), shared across subjects.
-        L_B = torch.linalg.cholesky(lmm._group_cov(self.sigma2 * lmm.resid_corr(), self.D))
+        p = self.X_fit.shape[1]
+        if lmm._woodbury:
+            A     = self._gram()
+            A_UU  = A[p + 1:, p + 1:]
+            UtBir = A[p + 1:, p:p + 1] - A[p + 1:, :p] @ self.beta
+        else:
+            L_B = torch.linalg.cholesky(lmm._group_cov(self.sigma2 * lmm.resid_corr(), self.D))
 
-        U     = lmm.U_grouped
-        BiU   = torch.cholesky_solve(U, L_B)
-        Bir   = torch.cholesky_solve(r_grouped.unsqueeze(-1), L_B)
-        Um    = U.reshape(G * nm, Ktot)
-        A_UU  = Um.transpose(0, 1) @ BiU.reshape(G * nm, Ktot)
-        UtBir = Um.transpose(0, 1) @ Bir.reshape(G * nm, 1)
+            U     = lmm.U_grouped
+            BiU   = torch.cholesky_solve(U, L_B)
+            Bir   = torch.cholesky_solve(r_grouped.unsqueeze(-1), L_B)
+            Um    = U.reshape(G * nm, Ktot)
+            A_UU  = Um.transpose(0, 1) @ BiU.reshape(G * nm, Ktot)
+            UtBir = Um.transpose(0, 1) @ Bir.reshape(G * nm, 1)
 
         lam   = self._lam()
         M     = A_UU + torch.diag(1.0 / lam)
@@ -321,7 +327,17 @@ class SmoothingSplineMixed:
         self.fitted_df = pd.concat(fitted_list, ignore_index=True)
         self.intercept = float(self.beta[self.px])
 
-        if random_effects:
+        if random_effects and lmm._woodbury:
+            # b_i = D_rel R_i' T_i^-1 Q_i'(r_i - U_i â)
+            b_hat = torch.zeros((G, self.pz), device=device, dtype=f64)
+            if self.pz:
+                D_rel = self.D / self.sigma2
+                W = lmm._wb_W
+                q = W[..., p:p + 1] - W[..., :p] @ self.beta - W[..., p + 1:] @ a_hat.unsqueeze(-1)
+                t = torch.cholesky_solve(q, lmm._woodbury_chol(D_rel))
+                b_hat = (D_rel @ lmm._wb_R.transpose(-1, -2) @ t).squeeze(-1)
+            self.rand_effects = b_hat.detach()
+        elif random_effects:
             # V⁻¹r = B⁻¹r − B⁻¹U â
             Vinv_r = Bir.squeeze(-1) - (BiU @ a_hat.unsqueeze(-1)).squeeze(-1)
             w = torch.zeros(N, device=device, dtype=f64)
@@ -343,12 +359,22 @@ class SmoothingSplineMixed:
         tau = self.tau_sq_list.clamp(min=floor)
         return torch.repeat_interleave(tau, self.lmm._K_repeats)
 
+    def _gram(self):
+        """[X y U]' B^-1 [X y U] with B = sigma^2 R + Z D Z' at the fit (iid fast path)."""
+        return self.lmm._woodbury_forms(self.D / self.sigma2)[1] / self.sigma2
+
     def _posterior_precision(self):
         """Posterior precision H of (beta, a) given the REML variance components, and the
         prior variances lam of a. Cov(beta, a | y) = H^{-1}."""
         f64 = torch.float64
         lmm = self.lmm
         G, nm, K, p = lmm.n_groups, lmm.nmax, lmm.K_tot, self.X_fit.shape[1]
+        lam = self._lam()
+        if lmm._woodbury:
+            keep = [i for i in range(p + K + 1) if i != p]
+            H = self._gram()[keep][:, keep]
+            H[p:, p:] += torch.diag(1.0 / lam)
+            return 0.5 * (H + H.T), lam
         L0 = torch.linalg.cholesky(lmm._group_cov(self.sigma2 * lmm.resid_corr(), self.D))
 
         X = lmm.X_grouped * lmm.mask.unsqueeze(-1)
@@ -357,7 +383,6 @@ class SmoothingSplineMixed:
         ViU = torch.cholesky_solve(U, L0).reshape(G * nm, K)
         X, U = X.reshape(G * nm, p), U.reshape(G * nm, K)
 
-        lam = self._lam()
         H = torch.zeros(p + K, p + K, dtype=f64, device=self.device)
         H[:p, :p] = X.T @ ViX
         H[p:, :p] = U.T @ ViX

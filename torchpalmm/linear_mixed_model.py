@@ -414,8 +414,9 @@ class LinearMixedModel:
             Vinv_r = (1.0/sigma2)*r_exp - (1.0/sigma2**2)*(Z @ tmp_r)
 
             logdetM = 2.0 * torch.sum(torch.log(torch.diagonal(L_M, dim1=-2, dim2=-1)), dim=-1)
-            logdetV = n_eff * torch.log(sigma2) + self.pz * torch.log(tau2) + logdetM
-            logdetV_sum = logdetV.sum() if logdetV.ndim > 0 else logdetV
+            n_pad = self.n_groups * self.nmax - n_eff
+            logdetV_sum = (n_eff * torch.log(sigma2) + self.n_groups * self.pz * torch.log(tau2)
+                           + logdetM.sum() + n_pad * math.log(1e6))
 
         else:
             L, _ = self._robust_cholesky(self._group_cov(sigma2, D))
