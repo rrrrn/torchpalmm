@@ -2,11 +2,26 @@
 import copy
 import warnings
 import torch
-from .linear_mixed_model import SummaryResult
-from .linear_mixed_model_smoothing import LinearMixedModelSmoothing, _checktensor
+from .linear_mixed_model import SummaryResult, _fill_names
+from .linear_mixed_model_smoothing import LinearMixedModelSmoothing
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+
+def _checktensor(x, dtype=torch.float64):
+    if torch.is_tensor(x):
+        return x.to(dtype=dtype)
+    return torch.as_tensor(np.asarray(x, dtype=float), dtype=dtype)
+
+
+def _colnames(v):
+    if isinstance(v, pd.DataFrame):
+        return [str(c) for c in v.columns]
+    if isinstance(v, pd.Series) and v.name is not None:
+        return [str(v.name)]
+    return None
+
 
 class SmoothingSplineMixed:
     @staticmethod
@@ -41,29 +56,39 @@ class SmoothingSplineMixed:
         return SmoothingSplineMixed.construct_Q(x), SmoothingSplineMixed.construct_R(x)
 
     @staticmethod
+    def place_knots(u, k):
+        """k knots spread evenly through the sorted distinct values u, as mgcv's place.knots (bs = "cr")."""
+        if k < 3:
+            raise ValueError("n_knots must be at least 3.")
+        pos = torch.linspace(0, u.numel() - 1, k, dtype=u.dtype, device=u.device)
+        lo = pos.floor().long().clamp(max=u.numel() - 2)
+        return u[lo] + (pos - lo) * (u[lo + 1] - u[lo])
+
+    @staticmethod
+    def basis_matrix(x, knots):
+        """N x k natural cubic spline evaluation f(x) = F g from knot values g (Green & Silverman 1994,
+        sec. 2.4); the 0/1 incidence matrix when every x is a knot."""
+        x, k = x.reshape(-1).contiguous(), knots.numel()
+        j = (torch.searchsorted(knots, x, right=True) - 1).clamp(0, k - 2)
+        h = (knots[1:] - knots[:-1])[j]
+        dl, dr = x - knots[j], knots[j + 1] - x
+        rows = torch.arange(x.numel(), device=x.device)
+        A = torch.zeros(x.numel(), k, dtype=x.dtype, device=x.device)
+        C = torch.zeros_like(A)
+        A[rows, j], A[rows, j + 1] = dr / h, dl / h
+        C[rows, j], C[rows, j + 1] = -dl * dr / 6 * (1 + dr / h), -dl * dr / 6 * (1 + dl / h)
+        Q, R = SmoothingSplineMixed.construct_Omega(knots)
+        return A + C[:, 1:-1] @ torch.linalg.solve(R, Q.T)       # second derivatives gamma = R^-1 Q' g
+
+    @staticmethod
     def construct_incidence_matrix(origin_vec, unique_vec, ids):
-        # returns (incidence [G, nmax, m], group indices)
-        device = origin_vec.device
-        dtype = torch.float64
-
-        unique_ids = torch.unique(ids)
-        G = len(unique_ids)
-        m = len(unique_vec)
-
-        group_indices = [(ids == g).nonzero(as_tuple=True)[0] for g in unique_ids]
-        group_sizes = [len(idx) for idx in group_indices]
-        nmax = max(group_sizes)
-
-        incidence_matrices = torch.zeros((G, nmax, m),
-                                        dtype=dtype,
-                                        device=device)
-
-        for g, g_idx in enumerate(group_indices):
-            group_size = len(g_idx)
-            matches = (origin_vec[g_idx][:, None] == unique_vec[None, :])
-            incidence_matrices[g, :group_size, :] = matches.float()
-
-        return incidence_matrices, group_indices
+        """Basis evaluation at origin_vec for knots unique_vec, grouped to [G, nmax, k]; and the group indices."""
+        group_indices = [(ids == g).nonzero(as_tuple=True)[0] for g in torch.unique(ids)]
+        pad = torch.nn.utils.rnn.pad_sequence(group_indices, batch_first=True)
+        valid = torch.arange(pad.shape[1], device=pad.device)[None, :] < torch.tensor(
+            [g.numel() for g in group_indices], device=pad.device)[:, None]
+        F = SmoothingSplineMixed.basis_matrix(origin_vec.to(torch.float64), unique_vec)
+        return F[pad] * valid.unsqueeze(-1), group_indices
 
     @staticmethod
     def prepare_design_matrix(original_vec, unique_vec, ids):
@@ -86,41 +111,58 @@ class SmoothingSplineMixed:
         input_tilde_unique = torch.stack((torch.ones_like(unique_vec), unique_vec), dim=1)
         return NB, B, input_tilde, input_tilde_unique, group_indices
 
-    def __init__(self, y, X, Z, spline_inputs, obs_id, device=None, corr_structure = 'iid', rand_D_type = 'diagonal',
-                 rand_D_estimate = 'sample', smooth_mask=None):
+    def __init__(self, y, X=None, Z=None, spline_inputs=None, obs_id=None, device=None, corr_structure = 'iid',
+                 rand_D_type = 'diagonal', rand_D_estimate = 'sample', smooth_mask=None, n_knots=None,
+                 standardize=False):
+        """X, Z: None means no columns; DataFrame columns name the summary rows. obs_id: subject labels of
+        any type. n_knots: int (or one per smooth) for a reduced-rank basis with knots placed as mgcv's
+        bs="cr"; None puts a knot at every distinct x. standardize: center and scale the non-binary X
+        columns internally; summary() reports their coefficients per original unit."""
         self.corr_structure = corr_structure; self.rand_D_type = rand_D_type; self.rand_D_estimate = rand_D_estimate
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = device
 
-        self.X = _checktensor(X).to(device=self.device)
+        N = len(y)
+        self.x_names, self.re_names, self.spline_names = (_colnames(v) for v in (X, Z, spline_inputs))
+        as2d = lambda v: v.unsqueeze(1) if v.dim() == 1 else v
+        self.X = as2d(_checktensor(np.zeros((N, 0)) if X is None else X).to(device=self.device))
         self.y = _checktensor(y).to(device=self.device)
-        self.Z = _checktensor(Z).to(device=self.device)
-        self.pz = Z.shape[1]; self.px = X.shape[1]
-        obs_id = _checktensor(obs_id).to(device=self.device)
-        self.nmax = max([(obs_id == g).sum().item() for g in torch.unique(obs_id)])
-        self.spline_inputs = _checktensor(spline_inputs).to(device=self.device)
-        if len(self.spline_inputs.shape) == 1:
-            self.spline_inputs = self.spline_inputs.unsqueeze(1)
+        self.Z = as2d(_checktensor(np.zeros((N, 0)) if Z is None else Z).to(device=self.device))
+        self.pz = self.Z.shape[1]; self.px = self.X.shape[1]
+        self.x_center = torch.zeros(self.px, dtype=self.X.dtype, device=self.device)
+        self.x_scale = torch.ones_like(self.x_center)
+        self.standardize = bool(standardize) and self.px > 0
+        if self.standardize:
+            cont = torch.tensor([self.X[:, j].unique().numel() > 2 for j in range(self.px)], device=self.device)
+            self.x_center[cont], self.x_scale[cont] = self.X[:, cont].mean(0), self.X[:, cont].std(0)
+            self.X = (self.X - self.x_center) / self.x_scale
+        ids = obs_id.cpu().numpy() if torch.is_tensor(obs_id) else np.asarray(obs_id)
+        codes, self.group_labels = pd.factorize(ids.reshape(-1), sort=True)
+        obs_id = torch.as_tensor(codes, device=self.device)
+        self.nmax = int(torch.bincount(obs_id).max())
+        self.spline_inputs = as2d(_checktensor(spline_inputs).to(device=self.device))
         self.obs_id = obs_id
 
         S = self.spline_inputs.shape[1]
         m = self._check_mask(smooth_mask, S)
         self.smooth_mask = m
-        # knots: distinct x on the rows where the spline is active (all rows when unmasked)
-        self.unique_spline_vec = []
+        nk = list(n_knots) if isinstance(n_knots, (list, tuple)) else [n_knots] * S
+        # distinct x on the rows where the spline is active (all rows when unmasked); the knots unless n_knots
+        self.unique_spline_vec, self.knots = [], []
         for i in range(S):
             sp = self.spline_inputs[:, i]
             u = torch.sort(torch.unique(sp if m is None else sp[m[:, i] != 0]))[0]
             if u.numel() < 3:
                 raise ValueError(f"spline {i} has {u.numel()} distinct active x-values; at least 3 are needed.")
             self.unique_spline_vec.append(u)
+            self.knots.append(u if nk[i] is None or u.numel() <= nk[i] else self.place_knots(u, nk[i]))
         X_fit = self.X; NB_list = []; B_list = []; self.spline_linear_col_idx = []
         self.spline_linear_center = []
         for i in range(S):
             sp = self.spline_inputs[:, i]
-            NB, B, input_tilde, _, group_indices = self.prepare_design_matrix(sp, self.unique_spline_vec[i], obs_id)
+            NB, B, input_tilde, _, group_indices = self.prepare_design_matrix(sp, self.knots[i], obs_id)
             if m is not None:
                 pad = torch.nn.utils.rnn.pad_sequence(group_indices, batch_first=True)
                 valid = torch.arange(pad.shape[1], device=pad.device)[None, :] < torch.tensor(
@@ -187,13 +229,13 @@ class SmoothingSplineMixed:
 
     def fit(self, warm_start=True, lr=1e-3, max_iter=1000, optimizer=torch.optim.Adam,
         tol=1e-6, max_iter_inner=10, convg_check="loss", fit_type="reml", grad_control_tol=1e-2,
-        tau_lr_mult=5.0, verbose=False, n_restarts=1, rho_init="moment"):
+        tau_lr_mult=5.0, verbose=False, n_restarts=1, rho_init="moment", check_hessian=False):
         self.lmm = LinearMixedModelSmoothing(device=self.device, y=self.y, X=self.X_fit, Z=self.Z,
                                             spline_inputs=self.NB_list,
                                             id=self.obs_id, corr_structure=self.corr_structure, rand_D_type=self.rand_D_type, rand_D_estimate=self.rand_D_estimate)
         self.lmm.fit_likelihood(lr=lr, max_iter=max_iter, tol=tol, verbose=verbose, optimizer=optimizer, fit_type=fit_type, warm_start=warm_start,
                                     max_iter_inner=max_iter_inner, convg_check=convg_check, grad_control_tol=grad_control_tol, tau_lr_mult=tau_lr_mult,
-                                    corr_init_method=rho_init)
+                                    corr_init_method=rho_init, check_hessian=check_hessian)
 
         # Random restarts: refit from different log-τ² and rho inits, keep the lowest loss.
         # log-τ² ~ U(-2, 4) covers τ² from ~0.1 to ~55; rho_raw ~ U(-3, 3) covers rho ~0.05 to ~0.95,
@@ -211,6 +253,7 @@ class SmoothingSplineMixed:
                     optimizer=optimizer, fit_type=fit_type, warm_start=False,
                     max_iter_inner=max_iter_inner, convg_check=convg_check,
                     grad_control_tol=grad_control_tol, tau_lr_mult=tau_lr_mult, init=init,
+                    check_hessian=check_hessian,
                 )
                 better = self.lmm.final_loss < best.final_loss
                 if verbose:
@@ -229,6 +272,7 @@ class SmoothingSplineMixed:
         self.beta = self.lmm.beta.detach()
         self.D = self.lmm.D.detach()
         self.tau_sq_list = self.lmm.tuning_params.detach()
+        self.boundary = self.lmm.boundary
         if self.lmm._has_corr_params() and self.lmm.nmax > 1:
             # lag-1 entry of the relative correlation (ρ for cs/ar1, exp(-φ) for exp)
             self.rho = float(self.lmm.resid_corr()[0, 1].detach())
@@ -309,7 +353,7 @@ class SmoothingSplineMixed:
         for c in colset:
             a_c    = a_hat[offsets[c]:offsets[c + 1]]
             Xeval  = torch.sort(self.unique_spline_vec[c].to(device))[0]
-            smooth = self.B_list[c].to(device) @ a_c
+            smooth = self._basis_at(c, Xeval) @ a_c
             slope_idx = self.spline_linear_col_idx[c]
             center_c  = self.spline_linear_center[c]
             if c == 0:
@@ -351,6 +395,10 @@ class SmoothingSplineMixed:
             self.rand_effects = None
 
         return self.fitted_df, self.rand_effects
+
+    def _basis_at(self, c, x):
+        """Rows of smooth c's penalized basis (knot evaluation times B) at x."""
+        return self.basis_matrix(x, self.knots[c]) @ self.B_list[c].to(self.device)
 
     def _lam(self):
         """Prior variances of the spline coefficients, floored at sigma^2 * exp(-20), the lower
@@ -400,7 +448,7 @@ class SmoothingSplineMixed:
         E[:, int(self.spline_linear_col_idx[c])] = u[idx] - self.spline_linear_center[c]
         if intercept and c == 0:
             E[:, self.px] = 1.0
-        E[:, p + off[c]: p + off[c + 1]] = self.B_list[c][idx]
+        E[:, p + off[c]: p + off[c + 1]] = self._basis_at(c, u[idx])
         return E
 
     def posterior_moments(self):
@@ -412,10 +460,10 @@ class SmoothingSplineMixed:
         H, _ = self._posterior_precision()
         return torch.cat([self.beta.reshape(-1), self._a_hat]), H
 
-    def smooth_sum_confint(self, ids, weights=None, alpha=0.05, with_mean=False):
+    def smooth_sum_confint(self, ids, weights=None, alpha=0.05, with_mean=False, transform=None):
         """Pointwise band for sum_c w_c f_c(x) on the x values shared by the smooths in ids,
         using their joint posterior covariance (e.g. ids=[0, 1] for f_ref + delta). Smooth 0
-        carries the intercept; with_mean=False centers the curve over the grid."""
+        carries the intercept; with_mean=False centers the curve over the grid. transform: see smooth_confint."""
         from scipy.stats import norm
         ids = list(ids)
         w = np.ones(len(ids)) if weights is None else np.asarray(weights, float)
@@ -433,8 +481,9 @@ class SmoothingSplineMixed:
         fit = (E @ mu).detach().cpu().numpy()
         se = torch.sqrt((E * torch.cholesky_solve(E.T, L_H).T).sum(1).clamp(min=0.0)).detach().cpu().numpy()
         z = float(norm.ppf(1.0 - alpha / 2.0))
-        return pd.DataFrame({"spline_var": grid.detach().cpu().numpy(), "fitted": fit, "se": se,
-                             "lower": fit - z * se, "upper": fit + z * se})
+        g = (lambda v: v) if transform is None else transform
+        return pd.DataFrame({"spline_var": grid.detach().cpu().numpy(), "fitted": g(fit), "se": se,
+                             "lower": g(fit - z * se), "upper": g(fit + z * se)})
 
     def fitted_values(self, conditional=False):
         """Per-row fitted values (N,), in input order. Marginal: X_fit beta + sum_c mask_c f_c^smooth(x),
@@ -446,9 +495,7 @@ class SmoothingSplineMixed:
         off = np.cumsum([0] + list(self.lmm.K_list))
         fit = (self.X_fit @ self.beta).reshape(-1)
         for c in range(self.spline_inputs.shape[1]):
-            u = self.unique_spline_vec[c]
-            idx = torch.searchsorted(u, self.spline_inputs[:, c].contiguous()).clamp(max=u.numel() - 1)
-            sm = self.B_list[c].to(dev)[idx] @ self._a_hat[off[c]:off[c + 1]]
+            sm = self._basis_at(c, self.spline_inputs[:, c]) @ self._a_hat[off[c]:off[c + 1]]
             fit = fit + (sm if self.smooth_mask is None else self.smooth_mask[:, c] * sm)
         if conditional:
             _, inv = torch.unique(self.obs_id.to(dev), sorted=True, return_inverse=True)
@@ -459,12 +506,49 @@ class SmoothingSplineMixed:
         """y minus fitted_values(conditional), one per row, in input order."""
         return self.y.reshape(-1).detach().cpu().numpy() - self.fitted_values(conditional=conditional)
 
-    def smooth_confint(self, alpha=0.05, col_smooth=None, z=None, with_mean=False):
+    def augment(self):
+        """Per-row DataFrame: group, y, marginal and conditional fitted values and residuals, and the
+        conditional residual standardized by its residual SD."""
+        y = self.y.reshape(-1).detach().cpu().numpy()
+        fm, fc = self.fitted_values(conditional=False), self.fitted_values(conditional=True)
+        fidx, mask = self.obs_flat_idx, self.lmm.mask.bool()
+        pos = torch.zeros(len(y), dtype=torch.long, device=self.device)
+        pos[fidx[mask]] = torch.arange(self.lmm.nmax, device=self.device).expand_as(fidx)[mask]
+        sd = torch.diagonal(self.resid_cov).sqrt()[pos].detach().cpu().numpy()
+        return pd.DataFrame({"group": self.group_labels[self.obs_id.cpu().numpy()], "y": y,
+                             "fitted_marginal": fm, "fitted_conditional": fc,
+                             "resid_marginal": y - fm, "resid_conditional": y - fc, "resid_std": (y - fc) / sd})
+
+    def random_effects(self):
+        """BLUPs b_i as a DataFrame indexed by subject label, one column per random effect."""
+        _, b = self.get_blup(random_effects=True)
+        return pd.DataFrame(b.detach().cpu().numpy(), index=pd.Index(self.group_labels, name="group"),
+                            columns=_fill_names(self.re_names, self.pz, "b"))
+
+    def r_squared(self):
+        """Nakagawa & Schielzeth (2013) marginal R2 (fixed part and smooths), conditional R2 (+ random
+        effects) and ICC = var_re / (var_re + sigma2), on the model scale."""
+        var_f = float(self.fitted_values(conditional=False).var())
+        var_re = float(((self.Z @ self.D) * self.Z).sum(1).mean()) if self.pz else 0.0
+        s2 = float(torch.diagonal(self.resid_cov).mean())
+        tot = var_f + var_re + s2
+        return pd.Series({"marginal_R2": var_f / tot, "conditional_R2": (var_f + var_re) / tot,
+                          "ICC": var_re / (var_re + s2)})
+
+    def convergence_diagnostics(self):
+        """Gradient norm, Hessian eigenvalues and boundary components of the fit (see LinearMixedModel)."""
+        if not hasattr(self, "lmm"):
+            raise ValueError("Model not fitted yet.")
+        return self.lmm.convergence_diagnostics()
+
+    def smooth_confint(self, alpha=0.05, col_smooth=None, z=None, with_mean=False, transform=None):
         """Pointwise confidence band for each smooth, conditional on the REML variance
         components. with_mean=False (mgcv's seWithMean=FALSE) returns the smooth centered over
         its x-grid, with the uncertainty of its shape only; with_mean=True keeps the level (the
         intercept for the first smooth) and its uncertainty, which Marra & Wood (2012) report
-        gives better coverage. Refs: Wahba (1983); Nychka (1988)."""
+        gives better coverage. Refs: Wahba (1983); Nychka (1988). transform: increasing function
+        applied to the curve and band ends (se stays on the model scale), e.g. np.exp for ratios of
+        a centered log-scale curve, or np.expm1 with with_mean=True to undo log1p."""
         if not hasattr(self, "beta"):
             raise ValueError("Model not fitted yet.")
         from scipy.stats import norm
@@ -490,6 +574,9 @@ class SmoothingSplineMixed:
             sub["se"]    = se
             sub["lower"] = sub["theta_fitted"] - z * se
             sub["upper"] = sub["theta_fitted"] + z * se
+            if transform is not None:
+                for k in ("theta_fitted", "lower", "upper"):
+                    sub[k] = transform(sub[k].to_numpy())
             out.append(sub)
         self.confint_df = pd.concat(out, ignore_index=True)
         return self.confint_df
@@ -508,12 +595,12 @@ class SmoothingSplineMixed:
             res = [row for row in res if row["coef"] < self.px]
         return res
 
-    def linearity_test(self, s=None, alpha=0.05, null_fit_kwargs=None):
-        """Score test of H0: smooth component s is linear (tau_s^2 = 0), delegated to
+    def linearity_test(self, s=None, alpha=0.05, null_fit_kwargs=None, test="score"):
+        """Test of H0: smooth component s is linear (tau_s^2 = 0), test="score" or "lrt", delegated to
         the fitted self.lmm. See docs/linearity_test.md. s=None tests all components."""
         if not hasattr(self, "lmm"):
             raise ValueError("Model not fitted yet.")
-        return self.lmm.linearity_test(s=s, alpha=alpha, null_fit_kwargs=null_fit_kwargs)
+        return self.lmm.linearity_test(s=s, alpha=alpha, null_fit_kwargs=null_fit_kwargs, test=test)
 
     def AIC(self):
         """AIC of the fitted model (see LinearMixedModelSmoothing.AIC)."""
@@ -552,11 +639,12 @@ class SmoothingSplineMixed:
         stat = ((V[:, :r].T @ w) ** 2 / ev[:r]).sum().item()
         return edf, stat, r, float(stats.chi2.sf(stat, r))
 
-    def spline_effect_test(self, s=None, alpha=0.05, null_fit_kwargs=None):
+    def spline_effect_test(self, s=None, alpha=0.05, null_fit_kwargs=None, nonlinear_test="score"):
         """H0: f_s = 0 for spline s (None = all). One row per spline, two tests:
         Fisher: -2 (log p_linear + log p_nonlinear) ~ chi2_4, combining the t-test of the
-          linear trend with the boundary score test of tau_s^2 = 0 (asymptotically independent).
-        Wald: Wood (2013)-style Wald test of the fitted smooth, chi2_r."""
+          linear trend with the test of tau_s^2 = 0 (nonlinear_test: "score" or "lrt", on a null refit).
+        Wald: Wood (2013)-style Wald test of the fitted smooth, chi2_r.
+        edf_conflict flags a rejection of linearity while the main fit's EDF is ~1."""
         if not hasattr(self, "lmm"):
             raise ValueError("Model not fitted yet.")
         from scipy import stats
@@ -567,37 +655,68 @@ class SmoothingSplineMixed:
         rows = []
         for c in (range(self.spline_inputs.shape[1]) if s is None else [s]):
             lin = self.lmm.fixed_t_test(l=int(self.spline_linear_col_idx[c]))
-            nonlin = self.lmm.linearity_test(s=c, alpha=alpha, null_fit_kwargs=null_fit_kwargs)
+            nonlin = self.lmm.linearity_test(s=c, alpha=alpha, null_fit_kwargs=null_fit_kwargs, test=nonlinear_test)
             stat = -2.0 * np.log(np.maximum([lin["p_value"], nonlin["p_value"]], 1e-300)).sum()
             p_fisher = float(stats.chi2.sf(stat, 4))
             edf, w_stat, w_df, p_wald = self._wald_smooth(c, fdf[fdf["spline_id"] == c], H, L_H, lam)
+            conflict = bool(nonlin["p_value"] < alpha and edf < 1.01)
+            if conflict:
+                warnings.warn(f"spline {c}: the {nonlinear_test} test rejects linearity (p = {nonlin['p_value']:.3g}) "
+                              f"but the main fit has EDF = {edf:.3f} (tau2 ~ 0), so the null refit and the main fit "
+                              f"disagree (null converged: {nonlin['null_converged']}). Check both fits' convergence "
+                              f"and compare nonlinear_test='lrt'.")
             rows.append(dict(spline_id=c, t_linear=lin["t"], p_linear=lin["p_value"],
-                             score_stat=nonlin["statistic"], p_nonlinear=nonlin["p_value"],
+                             nonlinear_test=nonlinear_test, null_converged=nonlin["null_converged"],
+                             score_stat=nonlin["statistic"], p_nonlinear=nonlin["p_value"], edf_conflict=conflict,
                              fisher_stat=stat, p_fisher=p_fisher,
                              edf=edf, wald_stat=w_stat, wald_df=w_df, p_wald=p_wald,
                              reject_fisher=bool(p_fisher < alpha), reject_wald=bool(p_wald < alpha)))
         return pd.DataFrame(rows)
 
-    def summary(self, names=None, spline_names=None, re_names=None, alpha=0.05, null_fit_kwargs=None):
+    def summary(self, names=None, spline_names=None, re_names=None, alpha=0.05, null_fit_kwargs=None,
+                nonlinear_test="score"):
         """{"coefficients", "variance", "splines"} DataFrames; displays as formatted tables when printed.
-        Coefficient rows: X, spline intercept, linear slope of each spline."""
+        Coefficient rows: X, spline intercept, linear slope of each spline. Names default to the
+        DataFrame columns given at construction; missing ones are filled as X1, spline1, b1, ..."""
         if not hasattr(self, "lmm"):
             raise ValueError("Model not fitted yet.")
         S = self.spline_inputs.shape[1]
-        names = list(names) if names is not None else [f"X{i + 1}" for i in range(self.px)]
-        sp = list(spline_names) if spline_names is not None else [f"spline{j + 1}" for j in range(S)]
-        if len(names) != self.px or len(sp) != S:
-            raise ValueError(f"names needs {self.px} entries and spline_names {S}.")
-        coefs = self.lmm.coef_table(names=names + ["(Intercept)"] + [f"s({n}) linear" for n in sp] + self.level_names,
+        names = _fill_names(names if names is not None else self.x_names, self.px, "X")
+        sp = _fill_names(spline_names if spline_names is not None else self.spline_names, S, "spline")
+        re_names = re_names if re_names is not None else self.re_names
+        icpt = "(Intercept, X at mean)" if self.x_center.any() else "(Intercept)"
+        coefs = self.lmm.coef_table(names=names + [icpt] + [f"s({n}) linear" for n in sp] + self.level_names,
                                         alpha=alpha)
+        if self.standardize:                      # per original unit of X; t, df and p are unchanged
+            cols, rows = ["estimate", "se", "ci_lower", "ci_upper"], coefs.index[:self.px]
+            coefs.loc[rows, cols] = coefs.loc[rows, cols].to_numpy() / self.x_scale.cpu().numpy()[:, None]
 
         tau = pd.DataFrame(dict(component=[f"tau2 s({n})" for n in sp],
                                 variance=self.tau_sq_list.detach().cpu().numpy()))
         var = pd.concat([self.lmm.variance_table(re_names=re_names), tau], ignore_index=True)
 
-        tests = self.spline_effect_test(alpha=alpha, null_fit_kwargs=null_fit_kwargs)
+        tests = self.spline_effect_test(alpha=alpha, null_fit_kwargs=null_fit_kwargs, nonlinear_test=nonlinear_test)
         tests.insert(1, "term", [f"s({sp[c]})" for c in tests["spline_id"]])
         return SummaryResult(coefficients=coefs, variance=var, splines=tests)
+
+    @classmethod
+    def from_dataframe(cls, data, y, smooth, group, x=(), random_slopes=(), random_intercept=True, **kwargs):
+        """Build from a DataFrame. x: columns (categoricals dummy-coded, first level as reference) or a
+        formulaic right-hand side such as "age + C(cls) * sex" (pip install formulaic; keep its intercept,
+        it is dropped after coding). group: subject labels. Rows with missing values are dropped."""
+        smooth = [smooth] if isinstance(smooth, str) else list(smooth)
+        data = data.dropna(subset=[y, group, *smooth, *random_slopes] + ([] if isinstance(x, str) else list(x)))
+        if isinstance(x, str):
+            from formulaic import model_matrix
+            Xdf = model_matrix(x, data).drop(columns="Intercept", errors="ignore")
+            data = data.loc[Xdf.index]
+        else:
+            Xdf = pd.get_dummies(data[list(x)], drop_first=True, dtype=float)
+        Zdf = data[list(random_slopes)].astype(float)
+        if random_intercept:
+            Zdf.insert(0, "(Intercept)", 1.0)
+        return cls(y=data[y].to_numpy(float), X=Xdf.astype(float), Z=Zdf, spline_inputs=data[smooth],
+                   obs_id=data[group].to_numpy(), **kwargs)
 
 
 class SmoothingSpline(SmoothingSplineMixed):
@@ -605,12 +724,11 @@ class SmoothingSpline(SmoothingSplineMixed):
     X and Z default to zero columns, obs_id to one group."""
 
     def __init__(self, y, X=None, Z=None, spline_inputs=None, obs_id=None, device=None, corr_structure='iid',
-                 rand_D_type='diagonal', rand_D_estimate='sample'):
+                 rand_D_type='diagonal', rand_D_estimate='sample', n_knots=None):
         N = len(y)
-        super().__init__(y=y, X=np.zeros((N, 0)) if X is None else X, Z=np.zeros((N, 0)) if Z is None else Z,
-                         spline_inputs=spline_inputs, obs_id=np.zeros(N) if obs_id is None else obs_id,
+        super().__init__(y=y, X=X, Z=Z, spline_inputs=spline_inputs, obs_id=np.zeros(N) if obs_id is None else obs_id,
                          device=device, corr_structure=corr_structure, rand_D_type=rand_D_type,
-                         rand_D_estimate=rand_D_estimate)
+                         rand_D_estimate=rand_D_estimate, n_knots=n_knots)
 
     def get_fitted_theta(self, col=0):
         """Fitted curve at the distinct x values: DataFrame with spline_var and theta_fitted."""

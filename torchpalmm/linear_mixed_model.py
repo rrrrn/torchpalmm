@@ -1,12 +1,21 @@
 import math
 import time
 import warnings
+import numpy as np
 import pandas as pd
 import torch
 def _checktensor(x):
     if not torch.is_tensor(x):
         x = torch.tensor(x)
     return x
+
+
+def _fill_names(names, n, prefix):
+    """Given names, padded with prefix1, prefix2, ... up to n."""
+    names = list(names) if names is not None else []
+    if len(names) > n:
+        raise ValueError(f"{len(names)} names given for {n} terms.")
+    return names + [f"{prefix}{i + 1}" for i in range(len(names), n)]
 
 class SummaryResult(dict):
     """Dict of summary DataFrames; printing it (or leaving it as a cell's last expression) shows the tables."""
@@ -59,13 +68,14 @@ class FitLog:
         print(f"  {it:5d}  {loss:15.6f}{cells}")
         self._shown = it
 
-    def done(self, converged, it, loss):
+    def done(self, converged, it, loss, detail=""):
         if not self.on:
             return
         if self._last is not None and self._shown != self._last[0]:
             self._print(*self._last)
-        status = f"converged at {self.unit} {it}" if converged else f"not converged, stopped at {self.unit} {it}"
-        print(f"  {status}: loss = {loss:.6f} ({time.perf_counter() - self._t0:.2f} s)")
+        noun = "outer step" if self.unit == "outer" else self.unit
+        status = f"converged at {noun} {it}" if converged else f"not converged, stopped at {noun} {it}"
+        print(f"  {status}{detail}: loss = {loss:.6f} ({time.perf_counter() - self._t0:.2f} s)")
 
 
 class LinearMixedModel:
@@ -434,6 +444,7 @@ class LinearMixedModel:
         opt.zero_grad()
         total_loss = loss_function(sigma2=sigma2, D=D)
         total_loss.backward()
+        grad_norm = sum(p.grad.norm().item() ** 2 for p in (self.sigma_L, self.L_elements) if p.grad is not None) ** 0.5
         opt.step()
         self._project_params()
 
@@ -462,10 +473,10 @@ class LinearMixedModel:
             if rel_change < tol:
                 convg_criteria = 1
         elif convg_check == "all":
-            if (rel_change < tol) and (beta_change < tol) and (D_change < tol) and (sigma2_change < tol):
+            if (rel_change < tol) and (beta_change < tol) and (D_change < tol) and (sigma2_change < tol) and grad_norm < 1e-2:
                 convg_criteria = 1
         elif convg_check == "params":
-            if (beta_change < tol) and (D_change < tol) and (sigma2_change < tol):
+            if (beta_change < tol) and (D_change < tol) and (sigma2_change < tol) and grad_norm < 1e-2:
                 convg_criteria = 1
         else:
             raise ValueError("Invalid convergence check method.")
@@ -486,15 +497,24 @@ class LinearMixedModel:
                    self._header_rows() + [("start", start)])
 
     def fit_likelihood(self, optimizer = torch.optim.Adam, lr=1e-3, max_iter=1000, fit_type = "REML",
-            tol=1e-6, warm_start=True, verbose=False, convg_check = "loss", max_iter_inner=10):
-        """fit_type: "REML" (default) or "ML". Only the loss differs; beta is profiled out (GLS) under both."""
+            tol=1e-6, warm_start=True, verbose=False, convg_check = "loss", max_iter_inner=10,
+            init=None, check_hessian=False):
+        """fit_type: "REML" (default) or "ML". Only the loss differs; beta is profiled out (GLS) under both.
+        init: dict of starting sigma_L / L_elements. check_hessian: also require a PD Hessian at an interior optimum."""
         if not (len(self.y_) == len(self.X_) == len(self.Z_)):
             raise ValueError("Incompatible shapes: y, X, and Z must have the same length.")
         self._check_fit_type(fit_type)
 
         self.fit_type = fit_type
+        self._fit_settings = dict(optimizer=optimizer, lr=lr, max_iter=max_iter, tol=tol,
+                                  convg_check=convg_check, max_iter_inner=max_iter_inner)
+        self._check_design()
         log = FitLog(verbose)
         beta, _ = self.reset_params(OLS=warm_start, estimate=self.rand_D_estimate)
+        if init is not None:
+            with torch.no_grad():
+                for name, val in init.items():
+                    getattr(self, name).copy_(val)
         if log.on:
             self._log_header(log, fit_type, beta, warm_start)
 
@@ -510,6 +530,7 @@ class LinearMixedModel:
         self.sigma2 = self.sigma2.clone().detach()
         self.D = self.D.clone().detach()
         self.beta = self.beta_.clone().detach()
+        self._check_fit(check_hessian)
         return self
 
     def _fit_adam(self, loss_function, params, beta, lr, max_iter, tol, convg_check, log):
@@ -545,8 +566,8 @@ class LinearMixedModel:
     def _fit_lbfgs(self, loss_function, params, beta, lr, max_iter, max_iter_inner, tol, convg_check, log):
         max_iter_inner = max_iter_inner or 10
         max_iter_outer = max_iter // max_iter_inner
-        log.table(f"LBFGS: lr={lr:g}, {max_iter_outer} epochs x {max_iter_inner} inner steps, "
-                  f"tol={tol:g} on {convg_check}", "epoch", "rel_loss", "rel_param", "grad_norm")
+        log.table(f"LBFGS: lr={lr:g}, max_iter={max_iter} ({max_iter_outer} outer steps of up to {max_iter_inner} "
+                  f"iterations), tol={tol:g} on {convg_check}", "outer", "rel_loss", "rel_param", "grad_norm")
         opt = torch.optim.LBFGS(params, lr=lr, max_iter=max_iter_inner,
                                 history_size=10, line_search_fn="strong_wolfe")
         prev_beta = beta.clone().detach()
@@ -588,14 +609,16 @@ class LinearMixedModel:
             log.row(epoch, current_loss, rel_loss, rel_param, grad_norm)
 
             if (rel_loss < tol) or grad_norm < 1e-2:
-                if convg_check not in ["params", "all"] or rel_param < tol:
+                if convg_check not in ["params", "all"] or (rel_param < tol and grad_norm < 1e-2):
                     convg = 1
                 break
 
-        log.done(convg, epoch, current_loss)
+        st = opt.state[opt._params[0]]
+        self.n_lbfgs_steps, self.n_func_evals = int(st.get('n_iter', 0)), int(st.get('func_evals', 0))
+        log.done(convg, epoch, current_loss, f" ({self.n_lbfgs_steps} L-BFGS iterations)")
         if convg == 0:
-            warnings.warn(f"LinearMixedModel: LBFGS did not converge in {max_iter_outer} epochs "
-                          f"(rel_loss={rel_loss:.2e}, grad_norm={grad_norm:.2e}).")
+            warnings.warn(f"LinearMixedModel: LBFGS did not converge within max_iter={max_iter} "
+                          f"({self.n_lbfgs_steps} L-BFGS iterations; rel_loss={rel_loss:.2e}, grad_norm={grad_norm:.2e}).")
         return convg, current_loss, current_sigma2, current_D, epoch
 
     @staticmethod
@@ -609,6 +632,67 @@ class LinearMixedModel:
             warnings.warn(f"{test} is a REML-based score test and refits its null model by REML; "
                           f"this model was fit by ML. Refit with fit_type='REML' for estimates "
                           f"consistent with the test.", stacklevel=3)
+
+    # --- Identifiability and convergence diagnostics ---
+
+    def _check_design(self):
+        """Warn when subjects have rank(Z_i) < q, e.g. fewer rows than random effects."""
+        if not self.pz:
+            return
+        k = int((torch.linalg.matrix_rank(self.masked_Z) < self.pz).sum())
+        if k:
+            warnings.warn(f"{type(self).__name__}: {k} of {self.n_groups} subjects ({k / self.n_groups:.0%}) have "
+                          f"rank(Z_i) < q = {self.pz} (e.g. fewer rows than random effects); their random effects "
+                          f"are not identified from their own rows and trade off against sigma^2.")
+
+    def variance_boundary(self, tol=1e-6):
+        """Variance components at ~0: share of var(y) (variance x mean squared design) below tol."""
+        if not self.pz:
+            return []
+        vy = float(self.y_.var())
+        zz = (self.masked_Z.pow(2).sum((0, 1)) / self.mask.sum()).sqrt()
+        Ds = self.D * torch.outer(zz, zz)
+        out = [f"Var(b{i + 1})" for i in range(self.pz) if Ds[i, i] < tol * vy]
+        if not out and self.pz > 1 and torch.linalg.eigvalsh(Ds).min() < tol * vy:
+            out.append("D (singular)")
+        return out
+
+    def _check_fit(self, check_hessian=False):
+        """Post-fit flags: residual collapse, variance components on the boundary, optional Hessian check."""
+        name, vy = type(self).__name__, float(self.y_.var())
+        s2 = float(self.sigma2.diagonal().mean() if self.sigma2.dim() == 2 else self.sigma2)
+        if s2 < 1e-3 * vy:
+            warnings.warn(f"{name}: residual variance {s2:.3g} is below 0.1% of var(y) = {vy:.3g}; the random "
+                          f"effects absorb the residual (overfit). Simplify Z.")
+        self.boundary = self.variance_boundary()
+        if self.boundary:
+            warnings.warn(f"{name}: variance component(s) on the boundary (~0): {', '.join(self.boundary)}. "
+                          f"converged does not mean an interior optimum; consider dropping them.")
+        if check_hessian:
+            d = self.convergence_diagnostics()
+            if not d["hessian_pd"] and not self.boundary:
+                self.convg = 0
+                warnings.warn(f"{name}: Hessian not positive definite at an interior point (saddle or unidentified "
+                              f"direction: {', '.join(d['flat_directions'])}); marked as not converged.")
+
+    def convergence_diagnostics(self):
+        """Gradient norm and Hessian eigenvalues of the criterion at the estimate, and the boundary components."""
+        state = self._ttest_state()
+        theta = state["theta"].clone().requires_grad_(True)
+        g = torch.autograd.grad(self.nll(theta), theta)[0]
+        return dict(converged=bool(self.convg), grad_norm=g.norm().item(), hessian_eigvals=state["eig"].tolist(),
+                    hessian_pd=not state["flat"], flat_directions=state["flat"], boundary=self.variance_boundary())
+
+    @staticmethod
+    def _fit_null_model(null, nfk, label):
+        """Fit a test's null model; its own warnings are replaced by one naming the test if it fails to converge."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            null.fit_likelihood(**nfk)
+        if not null.convg:
+            warnings.warn(f"{label}: the null refit did not converge within max_iter={nfk.get('max_iter')}; the test "
+                          f"is unreliable. Raise null_fit_kwargs['max_iter'].", stacklevel=4)
+        return null
 
     # --- Hypothesis testing for fixed effects ---
     # Satterthwaite t-test (lmerTest): t = l'b / sqrt(l'C l),
@@ -628,6 +712,17 @@ class LinearMixedModel:
     def _theta_hat(self):
         return torch.cat([self.sigma_L.detach().reshape(-1),
                           self.L_elements.detach().reshape(-1)], dim=0)
+
+    def _D_names(self, n):
+        if self._structure_kind(self.rand_D_type) == "unstructured":
+            r, c = torch.tril_indices(self.pz, self.pz)
+            return [f"L[{i + 1},{j + 1}]" for i, j in zip(r.tolist(), c.tolist())]
+        return [f"sd(b{i + 1})" for i in range(n)]
+
+    def _theta_names(self):
+        res = (["sigma", "rho_raw"] if self._has_resid_corr_param()
+               else [f"sigma[{k}]" for k in range(self.sigma_L.numel())])
+        return res + self._D_names(self.L_elements.numel())
 
     def unpack_theta(self, theta, q):
         n_resid = self._n_resid_params()
@@ -656,15 +751,31 @@ class LinearMixedModel:
         l_vec = l_vec.to(device=self.device, dtype=self.y_.dtype)
         f = (l_vec.transpose(0, 1) @ C @ l_vec).squeeze()
         grad_f = torch.autograd.grad(f, theta, retain_graph=True)[0]
-        var_f = grad_f @ A @ grad_f
+        var_f = (grad_f @ A @ grad_f).item()
         se = torch.sqrt(f)
         est = (l_vec.transpose(0, 1) @ self.beta.to(self.device)).squeeze()
-        t_hat = est / se
-        df = (2.0 * f ** 2) / var_f
+        t_hat = (est / se).item()
+        df = 2.0 * f.item() ** 2 / var_f if var_f > 0 else float("nan")
         from scipy import stats
-        p_value = 2.0 * (1.0 - stats.t.cdf(abs(t_hat.item()), df.item()))
-        return {"estimate": est.item(), "se": se.item(), "t": t_hat.item(),
-                "df": df.item(), "p_value": float(p_value)}
+        if math.isfinite(df) and df > 0:
+            p_value = 2.0 * (1.0 - stats.t.cdf(abs(t_hat), df))
+        else:
+            warnings.warn(f"{type(self).__name__}: Satterthwaite df undefined (var_f = {var_f:.3g}); "
+                          f"using a z reference (df = inf).")
+            df, p_value = float("inf"), 2.0 * stats.norm.sf(abs(t_hat))
+        return {"estimate": est.item(), "se": se.item(), "t": t_hat,
+                "df": df, "p_value": float(p_value)}
+
+    @staticmethod
+    def _projected_inverse(H, tol=1e-8):
+        """(A, eigvals, eigvecs, good): A = H^-1 if H is PD, else the inverse on its positive eigenspace."""
+        ev, V = torch.linalg.eigh(H)
+        good = ev > tol * ev.abs().max()
+        if good.all():
+            A = torch.linalg.inv(H + tol * torch.eye(H.shape[0], device=H.device, dtype=H.dtype))
+        else:
+            A = (V[:, good] / ev[good]) @ V[:, good].T
+        return A, ev, V, good
 
     def _ttest_state(self):
         """theta_hat and A = H^{-1}, H the Hessian of the nll at theta_hat. Cached until the
@@ -678,8 +789,15 @@ class LinearMixedModel:
             return c
         H = hessian(lambda th: self.nll(th), theta.clone().requires_grad_(True))
         H = 0.5 * (H + H.transpose(0, 1))
-        A = torch.linalg.inv(H + 1e-8 * torch.eye(H.shape[0], device=H.device, dtype=H.dtype))
-        self._tt_cache = dict(theta=theta, key=key, A=A, unit={})
+        A, ev, V, good = self._projected_inverse(H)
+        flat = []
+        if not good.all():
+            names = self._theta_names()
+            flat = list(dict.fromkeys(names[i] for i in V[:, ~good].abs().argmax(0).tolist()))
+            warnings.warn(f"{type(self).__name__}: Hessian of the {key or 'REML'} criterion is not positive definite "
+                          f"(smallest eigenvalue {ev.min().item():.3g}); flat or boundary direction(s): "
+                          f"{', '.join(flat)}. They are dropped from the Satterthwaite df (projected Hessian).")
+        self._tt_cache = dict(theta=theta, key=key, A=A, unit={}, eig=ev, flat=flat)
         return self._tt_cache
 
     def fixed_t_test(self, l=None):
@@ -724,12 +842,12 @@ class LinearMixedModel:
             raise ValueError("Model not fitted yet.")
         from scipy import stats
         rows = self.fixed_t_test(l=None)
-        names = list(names) if names is not None else [f"X{i + 1}" for i in range(len(rows))]
-        if len(names) != len(rows):
-            raise ValueError(f"names has {len(names)} entries, expected {len(rows)}.")
+        names = _fill_names(names, len(rows), "X")
         tab = pd.DataFrame(rows).drop(columns="coef")
         tab.insert(0, "term", names)
-        q = stats.t.ppf(1.0 - alpha / 2.0, tab["df"].to_numpy())
+        df = tab["df"].to_numpy()
+        q = np.where(np.isfinite(df), stats.t.ppf(1.0 - alpha / 2.0, np.where(np.isfinite(df), df, 1.0)),
+                     stats.norm.ppf(1.0 - alpha / 2.0))
         tab["ci_lower"] = tab["estimate"] - q * tab["se"]
         tab["ci_upper"] = tab["estimate"] + q * tab["se"]
         tab["sig"] = ["***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "." if p < 0.1 else "" for p in tab["p_value"]]
@@ -740,7 +858,7 @@ class LinearMixedModel:
         s2 = self.sigma2.detach().cpu()
         D = self.D.detach().cpu()
         q = D.shape[0]
-        re_names = list(re_names) if re_names is not None else [f"b{i + 1}" for i in range(q)]
+        re_names = _fill_names(re_names, q, "b")
         rows = [dict(component="residual", variance=s2.diagonal().mean().item() if s2.dim() == 2 else float(s2))]
         rows += [dict(component=f"Var({re_names[i]})", variance=D[i, i].item()) for i in range(q)]
         rows += [dict(component=f"Cov({re_names[j]}, {re_names[i]})", variance=D[i, j].item())
@@ -769,16 +887,23 @@ class LinearMixedModel:
             raise ValueError("random_effect_test needs at least one other random "
                               "effect left under the null; compare a no-random-"
                               "effects fit with lrt_test instead.")
-        nfk = dict(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=200,
-                   verbose=False, convg_check="loss")
+        # inherit the main fit's settings and warm-start from its estimates
+        nfk = dict(getattr(self, "_fit_settings", dict(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=200,
+                                                       convg_check="loss")), verbose=False, fit_type="REML")
+        kind = self._structure_kind(self.rand_D_type)
+        if kind == "unstructured":
+            Lk = self._robust_cholesky(self.D[keep][:, keep])[0]
+            L_el = Lk[tuple(torch.tril_indices(len(keep), len(keep), device=Lk.device))]
+        else:
+            L_el = self.L_elements.detach()[keep] if kind == "diag" else self.L_elements.detach()
+        nfk["init"] = dict(sigma_L=self.sigma_L.detach(), L_elements=L_el)
         if null_fit_kwargs:
             nfk.update(null_fit_kwargs)
 
         null = LinearMixedModel(device=self.device, y=self.y_, X=self.X_, Z=self.Z_[:, keep],
                                 id=self.id_, corr_structure=self.corr_structure,
                                 rand_D_type=self.rand_D_type, rand_D_estimate=self.rand_D_estimate)
-        null.fit_likelihood(optimizer=nfk["optimizer"], lr=nfk["lr"], max_iter=nfk["max_iter"],
-                            fit_type="REML", convg_check=nfk["convg_check"], verbose=nfk["verbose"])
+        self._fit_null_model(null, nfk, f"random_effect_test(q={idx})")
 
         return self._robust_cholesky(self._group_cov(null.sigma2, null.D, self.masked_Z[:, :, keep]))[0]
 

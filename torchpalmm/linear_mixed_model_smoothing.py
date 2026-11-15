@@ -374,10 +374,11 @@ class LinearMixedModelSmoothing(LinearMixedModel):
             if rel_change < tol and grad_norm < grad_control_tol:
                 convg_criteria = 1
         elif convg_check == "all":
-            if (rel_change < tol) and (beta_change < tol) and (D_change < tol) and (sigma2_change < tol):
+            if (rel_change < tol) and (beta_change < tol) and (D_change < tol) and (sigma2_change < tol) \
+                    and grad_norm < grad_control_tol:
                 convg_criteria = 1
         elif convg_check == "params":
-            if (beta_change < tol) and (D_change < tol) and (sigma2_change < tol):
+            if (beta_change < tol) and (D_change < tol) and (sigma2_change < tol) and grad_norm < grad_control_tol:
                 convg_criteria = 1
         else:
             raise ValueError("Invalid convergence check method.")
@@ -391,11 +392,13 @@ class LinearMixedModelSmoothing(LinearMixedModel):
     def fit_likelihood(self, optimizer=torch.optim.Adam, lr=1e-3, max_iter=1000, fit_type="REML",
                        tol=1e-6, warm_start=True, verbose=False, convg_check="loss",
                        max_iter_inner=10, tau_lr_mult=5.0, grad_control_tol=1e-2,
-                       corr_init_method="moment", plateau_patience=5, init=None):
+                       corr_init_method="moment", plateau_patience=5, init=None, check_hessian=False):
         """
         fit_type         : "REML" (default) or "ML"; both profile beta and sigma^2 out analytically.
         init             : dict with D_params, spline_params (log tau^2) and optionally rho_raw,
                            used as the starting values in place of the default initialization.
+        check_hessian    : also require a positive definite Hessian at an interior optimum.
+        convg_check      : "all" and "params" also require grad_norm < grad_control_tol.
         tau_lr_mult      : lr multiplier for spline_params vs D_params in Adam.
         corr_init_method : "fixed" (rho_raw=0) or "moment" (default; data-driven
                            init via within-group OLS-residual correlations; avoids the
@@ -406,6 +409,11 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                            gradient noise keeps grad_norm from ever clearing grad_control_tol.
         """
         self._check_fit_type(fit_type)
+        self._fit_settings = dict(optimizer=optimizer, lr=lr, max_iter=max_iter, tol=tol, convg_check=convg_check,
+                                  max_iter_inner=max_iter_inner, tau_lr_mult=tau_lr_mult,
+                                  grad_control_tol=grad_control_tol, corr_init_method=corr_init_method,
+                                  plateau_patience=plateau_patience)
+        self._check_design()
         log = FitLog(verbose)
         beta, sigma2 = self.reset_params(OLS=warm_start, estimate=self.rand_D_estimate,
                                          corr_init_method=corr_init_method)
@@ -471,8 +479,9 @@ class LinearMixedModelSmoothing(LinearMixedModel):
             if max_iter_inner is None:
                 max_iter_inner = 10
             max_iter_outer = max_iter // max_iter_inner
-            log.table(f"LBFGS: lr={lr:g}, {max_iter_outer} epochs x {max_iter_inner} inner steps, "
-                      f"tol={tol:g} on {convg_check}", "epoch", "rel_loss", "rel_param", "grad_norm")
+            log.table(f"LBFGS: lr={lr:g}, max_iter={max_iter} ({max_iter_outer} outer steps of up to "
+                      f"{max_iter_inner} iterations), tol={tol:g} on {convg_check}",
+                      "outer", "rel_loss", "rel_param", "grad_norm")
 
             # Joint LBFGS over D_params + spline_params: τ sees the same second-order
             # curvature as D, not just 1 Adam step per outer epoch.
@@ -553,10 +562,10 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                     if (rel_loss < tol and grad_norm < grad_control_tol) or plateau >= plateau_patience:
                         convg = 1
                 elif convg_check == "all":
-                    if rel_loss < tol and rel_param < tol:
+                    if rel_loss < tol and rel_param < tol and grad_norm < grad_control_tol:
                         convg = 1
                 elif convg_check == "params":
-                    if rel_param < tol:
+                    if rel_param < tol and grad_norm < grad_control_tol:
                         convg = 1
                 elif convg_check == "grad":
                     if grad_norm < tol:
@@ -569,10 +578,12 @@ class LinearMixedModelSmoothing(LinearMixedModel):
 
             st = opt_joint.state[opt_joint._params[0]]               # PyTorch's cumulative LBFGS counters
             self.n_epochs, self.n_lbfgs_steps, self.n_func_evals = epoch + 1, int(st.get('n_iter', 0)), int(st.get('func_evals', 0))
-            log.done(convg, epoch, current_loss)
+            log.done(convg, epoch, current_loss,
+                     f" ({self.n_lbfgs_steps} L-BFGS iterations, {self.n_func_evals} evaluations)")
             if convg == 0:
-                warnings.warn(f"LinearMixedModelSmoothing: LBFGS did not converge in "
-                              f"{max_iter_outer} epochs (rel_loss={rel_loss:.2e}, grad_norm={grad_norm:.2e}).")
+                warnings.warn(f"LinearMixedModelSmoothing: LBFGS did not converge within max_iter={max_iter} "
+                              f"({self.n_lbfgs_steps} L-BFGS iterations in {epoch + 1} outer steps; "
+                              f"rel_loss={rel_loss:.2e}, grad_norm={grad_norm:.2e}).")
 
         self.final_loss   = current_loss
         self.convg        = convg
@@ -582,7 +593,15 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         self.D            = current_D.clone().detach() * self.sigma2
         self.tuning_params = current_spline_param.clone().detach() * self.sigma2
         self.n_iter       = (epoch + 1) * max_iter_inner if optimizer == torch.optim.LBFGS else step
+        self._check_fit(check_hessian)
         return self
+
+    def variance_boundary(self, tol=1e-6):
+        """Adds the smooths whose prior variance share tau2 * mean ||NB_ij||^2 / var(y) is below tol."""
+        contrib = torch.split(self.U_grouped.pow(2).sum((0, 1)), self.K_list)
+        vy, n = float(self.y_.var()), self.mask.sum()
+        return super().variance_boundary(tol) + [
+            f"tau2 s{s + 1}" for s, (t2, c) in enumerate(zip(self.tuning_params, contrib)) if t2 * c.sum() / n < tol * vy]
 
     # --- Fixed-effect hypothesis testing (Satterthwaite; σ² profiled, in θ as log σ²) ---
     # Reuses the inherited fixed_t_test / _contrast_test; only the
@@ -595,6 +614,12 @@ class LinearMixedModelSmoothing(LinearMixedModel):
             parts.append(self.rho_raw.detach().reshape(-1))
         parts.append(torch.log(self.sigma2.to(self.device).reshape(1)))
         return torch.cat(parts)
+
+    def _theta_names(self):
+        names = self._D_names(self.D_params.numel()) + [f"log tau2 s{s + 1}" for s in range(self.len_spline)]
+        if self._has_corr_params():
+            names += [f"rho_raw[{k}]" for k in range(self.rho_raw.numel())]
+        return names + ["log sigma2"]
 
     def _split_theta(self, theta):
         n_d, n_s = self.D_params.numel(), self.spline_params.numel()
@@ -636,61 +661,65 @@ class LinearMixedModelSmoothing(LinearMixedModel):
     # tau^2 scale: the internal log(tau^2) score is identically zero at the boundary.
     # Only the null fit is needed. See docs/linearity_test.md.
 
-    def _assemble_null_chol(self, s, y=None, null_fit_kwargs=None):
-        """Fit the H0 (tau_s^2 = 0) model and return the per-group Cholesky of V0, the absolute
-        marginal covariance with component s's smooth dropped but its linear column retained
-        (it lives in X_). V0 is built from the tested model's own grouped Z / NB so group/mask
-        alignment is exact."""
+    def _fit_null(self, s, y=None, null_fit_kwargs=None, fit_type="REML"):
+        """Refit with smooth s dropped (tau_s^2 = 0; its linear column stays in X_), inheriting the main
+        fit's settings and warm-started from its estimates. Returns (null model, other smooth ids)."""
         y = self.y_ if y is None else _checktensor(y).to(self.device).view(-1, 1)
-        nfk = dict(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=200,
-                   verbose=False, convg_check="loss")
         others = [j for j in range(self.len_spline) if j != s]
-        if others and hasattr(self, "D_params"):
-            nfk["init"] = dict(D_params=self.D_params.detach(),
-                               spline_params=self.spline_params.detach()[others])
+        nfk = dict(getattr(self, "_fit_settings", dict(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=200,
+                                                       convg_check="loss")), verbose=False, fit_type=fit_type)
+        if hasattr(self, "D_params"):
+            nfk["init"] = dict(D_params=self.D_params.detach())
+            if others:
+                nfk["init"]["spline_params"] = self.spline_params.detach()[others]
             if self._has_corr_params():
                 nfk["init"]["rho_raw"] = self.rho_raw.detach()
         if null_fit_kwargs:
             nfk.update(null_fit_kwargs)
+        # a zero basis adds nothing to V or the REML, so a null with no smooth left stays in this class
+        NB = [self.NB_list[j] for j in others] or [
+            torch.zeros(self.n_groups, self.nmax, 1, device=self.device, dtype=self.y_.dtype)]
+        null = LinearMixedModelSmoothing(
+            device=self.device, y=y, X=self.X_, Z=self.Z_, id=self.id_, spline_inputs=NB,
+            corr_structure=self.corr_structure, rand_D_type=self.rand_D_type,
+            rand_D_estimate=self.rand_D_estimate)
+        return self._fit_null_model(null, nfk, f"linearity_test(s={s})"), others
 
-        if others:
-            null = LinearMixedModelSmoothing(
-                device=self.device, y=y, X=self.X_, Z=self.Z_, id=self.id_,
-                spline_inputs=[self.NB_list[j] for j in others],
-                corr_structure=self.corr_structure, rand_D_type=self.rand_D_type,
-                rand_D_estimate=self.rand_D_estimate)
-            null.fit_likelihood(**nfk)
-            D_abs    = null.D
-            resid    = (null.sigma2 * null.resid_corr()).expand(self.n_groups, -1, -1).clone()
-            for j, tau2 in zip(others, null.tuning_params.tolist()):
-                k0  = sum(self.K_list[:j])
-                U_j = self.U_grouped[:, :, k0:k0 + self.K_list[j]]
-                resid.baddbmm_(U_j, U_j.transpose(-1, -2), alpha=tau2)      # += tau^2 NB NB'
-        else:
-            null = LinearMixedModel(
-                y=y, X=self.X_, Z=self.Z_, id=self.id_,
-                corr_structure=self.corr_structure, rand_D_type=self.rand_D_type)
-            null.fit_likelihood(optimizer=nfk["optimizer"], lr=nfk["lr"],
-                                max_iter=nfk["max_iter"], fit_type="REML",
-                                convg_check=nfk["convg_check"], verbose=nfk["verbose"])
-            D_abs  = null.D
-            resid  = null.sigma2
+    def _null_chol(self, null, others):
+        """Per-group Cholesky of the null's absolute marginal covariance V0, built from this model's
+        own grouped Z / NB so group/mask alignment is exact."""
+        resid = (null.sigma2 * null.resid_corr()).expand(self.n_groups, -1, -1).clone()
+        for j, tau2 in zip(others, null.tuning_params.tolist()):
+            k0  = sum(self.K_list[:j])
+            U_j = self.U_grouped[:, :, k0:k0 + self.K_list[j]]
+            resid.baddbmm_(U_j, U_j.transpose(-1, -2), alpha=tau2)      # += tau^2 NB NB'
+        return self._robust_cholesky(self._group_cov(resid, null.D))[0]
 
-        return self._robust_cholesky(self._group_cov(resid, D_abs))[0]
-
-    def linearity_test(self, s=None, alpha=0.05, null_fit_kwargs=None):
-        """Score test of H0: smooth component s is linear (tau_s^2 = 0) vs nonlinear,
-        with the Zhang & Lin (2003) scaled chi-square reference.
-
-        s=None tests every component and returns a list of result dicts.
-        Returns a dict with spline_id, statistic, df, scale_a, p_value, reject.
-        """
+    def linearity_test(self, s=None, alpha=0.05, null_fit_kwargs=None, test="score"):
+        """Test of H0: smooth component s is linear (tau_s^2 = 0) vs nonlinear, on a null refit.
+        test="score": Zhang & Lin (2003) scaled chi-square reference; test="lrt": likelihood ratio with
+        the 50:50 chi2_0 / chi2_1 boundary mixture (Self & Liang 1987; Stram & Lee 1994).
+        s=None tests every component. Returns a dict with spline_id, test, statistic, df, p_value,
+        null_converged, reject."""
         if s is None:
-            return [self.linearity_test(j, alpha=alpha, null_fit_kwargs=null_fit_kwargs)
+            return [self.linearity_test(j, alpha=alpha, null_fit_kwargs=null_fit_kwargs, test=test)
                     for j in range(self.len_spline)]
-        self._warn_if_ml("linearity_test")
-        L_V0 = self._assemble_null_chol(s, null_fit_kwargs=null_fit_kwargs)
-        S_plus, e, info = self._boundary_score(self.NB_list[s] * self.mask.unsqueeze(-1), L_V0)
-        out = self._boundary_pvalue(S_plus, e, info)
-        out.update(spline_id=s, reject=bool(out["p_value"] < alpha))
+        if test == "lrt":
+            from scipy import stats
+            null, _ = self._fit_null(s, null_fit_kwargs=null_fit_kwargs, fit_type=self.fit_type)
+            gap = 2.0 * (null.final_loss - self.final_loss)
+            if gap < -1e-2:
+                warnings.warn(f"linearity_test(s={s}): the null refit reached a better criterion than the full fit "
+                              f"(by {-gap / 2:.3g}); the full fit is not at its optimum.")
+            stat = max(gap, 0.0)
+            out = {"statistic": stat, "df": 1.0, "p_value": float(0.5 * stats.chi2.sf(stat, 1)) if stat > 0 else 1.0}
+        elif test == "score":
+            self._warn_if_ml("linearity_test")
+            null, others = self._fit_null(s, null_fit_kwargs=null_fit_kwargs)
+            S_plus, e, info = self._boundary_score(self.NB_list[s] * self.mask.unsqueeze(-1),
+                                                   self._null_chol(null, others))
+            out = self._boundary_pvalue(S_plus, e, info)
+        else:
+            raise ValueError('test must be "score" or "lrt".')
+        out.update(spline_id=s, test=test, null_converged=bool(null.convg), reject=bool(out["p_value"] < alpha))
         return out

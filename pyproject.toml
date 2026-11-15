@@ -32,6 +32,7 @@ dynamic = ["version"]
 [project.optional-dependencies]
 examples = ["matplotlib", "jupyter"]
 test = ["pytest"]
+formula = ["formulaic"]
 
 [project.urls]
 Homepage = "https://github.com/rrrrn/torchpalmm"

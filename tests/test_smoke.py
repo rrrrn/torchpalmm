@@ -195,7 +195,7 @@ def _reference_t_test(m, l):
     from torch.autograd.functional import hessian
     th = m._theta_hat().requires_grad_(True)
     H = hessian(lambda t: m.nll(t), th)
-    A = torch.linalg.inv(0.5 * (H + H.T) + 1e-8 * torch.eye(H.shape[0]))
+    A = LinearMixedModel._projected_inverse(0.5 * (H + H.T))[0]
     px = m.X_.shape[1]
     v = torch.zeros(px, 1); v[l] = 1.0
     f = (v.T @ m.C_theta(th) @ v).squeeze()
@@ -463,3 +463,43 @@ def test_random_restarts_keep_best_fit():
     base = ss.lmm.final_loss
     ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=100, fit_type="reml", verbose=False, n_restarts=3)
     assert ss.lmm.final_loss <= base + 1e-8
+
+
+def test_satterthwaite_falls_back_to_z():
+    rng = np.random.default_rng(0)
+    ids = np.repeat(np.arange(20), 6)
+    X = np.column_stack([np.ones(120), rng.normal(size=120)])
+    y = (X @ [1.0, 0.5] + np.repeat(rng.normal(scale=0.6, size=20), 6) + rng.normal(size=120))[:, None]
+    m = LinearMixedModel(y=y, X=X, Z=np.ones((120, 1)), id=ids, corr_structure="iid", rand_D_type="diagonal")
+    m.fit_likelihood(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=200, fit_type="REML")
+    state = m._ttest_state()
+    state["A"].zero_(); state["unit"].clear()                    # var_f = 0: df undefined
+    with pytest.warns(UserWarning, match="z reference"):
+        r = m.fixed_t_test(1)
+    assert r["df"] == float("inf") and 0.0 <= r["p_value"] <= 1.0
+    assert np.isfinite(m.coef_table()[["ci_lower", "ci_upper"]].to_numpy()).all()
+
+
+def test_dataframe_labels_knots_and_helpers():
+    import pandas as pd
+    rng = np.random.default_rng(6)
+    G, ni = 30, 6
+    df = pd.DataFrame({"subj": np.repeat([f"s{i:02d}" for i in range(G)], ni),
+                       "t": rng.uniform(0, 1, G * ni), "grp": rng.choice(["a", "b", "c"], G * ni)})
+    df["y"] = (np.sin(2 * np.pi * df["t"]) + (df["grp"] == "b") + np.repeat(rng.normal(scale=0.5, size=G), ni)
+               + rng.normal(scale=0.3, size=G * ni))
+    ss = SmoothingSplineMixed.from_dataframe(df, y="y", smooth="t", group="subj", x=["grp"], n_knots=10, device="cpu")
+    assert ss.NB_list[0].shape[2] == 8 and ss.x_names == ["grp_b", "grp_c"]
+    ss.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=200, fit_type="reml")
+    assert list(ss.summary()["coefficients"]["term"][:3]) == ["grp_b", "grp_c", "(Intercept)"]
+    assert list(ss.random_effects().index[:2]) == ["s00", "s01"]
+    aug = ss.augment()
+    assert len(aug) == G * ni and np.isfinite(aug["resid_std"]).all()
+    r2 = ss.r_squared()
+    assert 0.0 <= r2["marginal_R2"] <= r2["conditional_R2"] <= 1.0
+    lrt = ss.linearity_test(s=0, test="lrt")
+    assert lrt["test"] == "lrt" and 0.0 <= lrt["p_value"] <= 1.0
+
+    nox = SmoothingSplineMixed(y=df["y"], Z=np.ones((G * ni, 1)), spline_inputs=df["t"], obs_id=df["subj"], device="cpu")
+    nox.fit(optimizer=torch.optim.LBFGS, lr=1.0, max_iter=200, fit_type="reml")
+    assert nox.summary()["coefficients"]["term"].tolist() == ["(Intercept)", "s(t) linear"]
