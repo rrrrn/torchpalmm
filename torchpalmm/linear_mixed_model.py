@@ -649,10 +649,10 @@ class LinearMixedModel:
         """Variance components at ~0: share of var(y) (variance x mean squared design) below tol."""
         if not self.pz:
             return []
-        vy = float(self.y_.var())
+        vy, re = float(self.y_.var()), self._re_labels()
         zz = (self.masked_Z.pow(2).sum((0, 1)) / self.mask.sum()).sqrt()
         Ds = self.D * torch.outer(zz, zz)
-        out = [f"Var(b{i + 1})" for i in range(self.pz) if Ds[i, i] < tol * vy]
+        out = [f"Var({re[i]})" for i in range(self.pz) if Ds[i, i] < tol * vy]
         if not out and self.pz > 1 and torch.linalg.eigvalsh(Ds).min() < tol * vy:
             out.append("D (singular)")
         return out
@@ -713,11 +713,16 @@ class LinearMixedModel:
         return torch.cat([self.sigma_L.detach().reshape(-1),
                           self.L_elements.detach().reshape(-1)], dim=0)
 
+    def _re_labels(self):
+        """Random-effect labels shared by the variance table, boundary flags and Hessian warnings."""
+        return _fill_names(getattr(self, "re_labels", None), self.pz, "b")
+
     def _D_names(self, n):
+        re = self._re_labels()
         if self._structure_kind(self.rand_D_type) == "unstructured":
             r, c = torch.tril_indices(self.pz, self.pz)
-            return [f"L[{i + 1},{j + 1}]" for i, j in zip(r.tolist(), c.tolist())]
-        return [f"sd(b{i + 1})" for i in range(n)]
+            return [f"L[{re[i]},{re[j]}]" for i, j in zip(r.tolist(), c.tolist())]
+        return [f"Var({x})" for x in re] if n == len(re) else ["Var(b)"] * n
 
     def _theta_names(self):
         res = (["sigma", "rho_raw"] if self._has_resid_corr_param()
@@ -794,9 +799,14 @@ class LinearMixedModel:
         if not good.all():
             names = self._theta_names()
             flat = list(dict.fromkeys(names[i] for i in V[:, ~good].abs().argmax(0).tolist()))
-            warnings.warn(f"{type(self).__name__}: Hessian of the {key or 'REML'} criterion is not positive definite "
-                          f"(smallest eigenvalue {ev.min().item():.3g}); flat or boundary direction(s): "
-                          f"{', '.join(flat)}. They are dropped from the Satterthwaite df (projected Hessian).")
+            if set(flat) <= set(self.variance_boundary()):
+                warnings.warn(f"{type(self).__name__}: the Hessian is flat only along boundary component(s) "
+                              f"{', '.join(flat)} (estimated at ~0); the Satterthwaite df hold them at 0, as in a "
+                              f"model without them. This is expected for a variance at 0.")
+            else:
+                warnings.warn(f"{type(self).__name__}: Hessian of the {key or 'REML'} criterion is not positive "
+                              f"definite (smallest eigenvalue {ev.min().item():.3g}); flat or boundary direction(s): "
+                              f"{', '.join(flat)}. They are dropped from the Satterthwaite df (projected Hessian).")
         self._tt_cache = dict(theta=theta, key=key, A=A, unit={}, eig=ev, flat=flat)
         return self._tt_cache
 
@@ -858,7 +868,7 @@ class LinearMixedModel:
         s2 = self.sigma2.detach().cpu()
         D = self.D.detach().cpu()
         q = D.shape[0]
-        re_names = _fill_names(re_names, q, "b")
+        re_names = _fill_names(re_names, q, "b") if re_names is not None else self._re_labels()
         rows = [dict(component="residual", variance=s2.diagonal().mean().item() if s2.dim() == 2 else float(s2))]
         rows += [dict(component=f"Var({re_names[i]})", variance=D[i, i].item()) for i in range(q)]
         rows += [dict(component=f"Cov({re_names[j]}, {re_names[i]})", variance=D[i, j].item())

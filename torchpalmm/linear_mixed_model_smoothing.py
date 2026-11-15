@@ -1,7 +1,7 @@
 import math
 import warnings
 import torch
-from .linear_mixed_model import FitLog, LinearMixedModel
+from .linear_mixed_model import FitLog, LinearMixedModel, _fill_names
 def _checktensor(x, dtype = torch.float64):
     if torch.is_tensor(x):
         return x.to(dtype=dtype)
@@ -405,6 +405,8 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                            rho→1 / sigma2→large spurious local minimum for large pz).
         plateau_patience : (LBFGS, convg_check="loss") also converge once rel_loss < tol
                            holds for this many consecutive epochs, regardless of grad_norm.
+                           Epochs with no progress at all and grad_norm >= grad_control_tol are
+                           line-search stalls, not a plateau: they trigger one L-BFGS restart.
                            Catches the case where the loss has genuinely converged but
                            gradient noise keeps grad_norm from ever clearing grad_control_tol.
         """
@@ -492,10 +494,10 @@ class LinearMixedModelSmoothing(LinearMixedModel):
             if self._has_corr_params():
                 lbfgs_params.append(self.rho_raw)
 
-            opt_joint = torch.optim.LBFGS(
-                lbfgs_params, lr=lr, max_iter=max_iter_inner,
-                history_size=10, line_search_fn="strong_wolfe"
-            )
+            def make_opt():
+                return torch.optim.LBFGS(lbfgs_params, lr=lr, max_iter=max_iter_inner,
+                                         history_size=10, line_search_fn="strong_wolfe")
+            opt_joint = make_opt()
 
             evaluated = [False]
 
@@ -521,23 +523,22 @@ class LinearMixedModelSmoothing(LinearMixedModel):
             convg = 0
             epoch = 0
             plateau = 0
+            stalls = 0
+            done_iters = done_evals = 0
             for epoch in range(max_iter_outer):
                 opt_joint.step(closure_joint)
                 self._project_params()
 
-                grad_norm = sum(
-                    p.grad.norm().item() ** 2
-                    for p in lbfgs_params
-                    if p.grad is not None
-                ) ** 0.5
+                # Loss and gradient at the post-step, post-projection iterate (p.grad can be from a
+                # rejected line-search trial point, whose gradient the closure zeroes).
+                D_           = self.param_to_sqmatrix(self.D_params, n=self.pz, correlation_structure=self.rand_D_type)
+                loss_post, _ = loss_function(D=D_, spline_param=self.spline_params)
+                grads        = torch.autograd.grad(loss_post, lbfgs_params, allow_unused=True)
+                grad_norm    = sum(g.norm().item() ** 2 for g in grads if g is not None) ** 0.5
 
                 with torch.no_grad():
-                    # LBFGS.step() returns the closure's pre-step loss; recompute here
-                    # so current_loss/beta_/sigma2 reflect the post-step, post-projection state.
-                    D_           = self.param_to_sqmatrix(self.D_params, n=self.pz, correlation_structure=self.rand_D_type)
-                    loss_post, _ = loss_function(D=D_, spline_param=self.spline_params)
-                    self.beta_   = self._beta_cache
-                    self.sigma2  = self._sigma2_cache
+                    self.beta_   = self._beta_cache.detach()
+                    self.sigma2  = self._sigma2_cache.detach()
                     current_loss          = loss_post.item()
                     current_sigma2        = self.sigma2.clone().detach()
                     current_D             = D_.clone().detach()
@@ -556,6 +557,19 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                 prev_sigma2       = current_sigma2.detach()
                 prev_spline_param = current_spline_param.detach()
                 log.row(epoch, current_loss, rel_loss, rel_param, grad_norm)
+
+                # No progress with a large gradient: a failed line search, which L-BFGS repeats forever because
+                # its curvature memory persists across step() calls. Restart once from steepest descent; a
+                # second consecutive stall ends the fit as not converged.
+                if rel_loss < 1e-12 and grad_norm >= grad_control_tol:
+                    stalls, plateau = stalls + 1, 0
+                    if stalls >= 2:
+                        break
+                    st = opt_joint.state[opt_joint._params[0]]
+                    done_iters, done_evals = done_iters + int(st.get('n_iter', 0)), done_evals + int(st.get('func_evals', 0))
+                    opt_joint = make_opt()
+                    continue
+                stalls = 0
 
                 if convg_check == "loss":
                     plateau = plateau + 1 if rel_loss < tol else 0
@@ -577,13 +591,18 @@ class LinearMixedModelSmoothing(LinearMixedModel):
                     break
 
             st = opt_joint.state[opt_joint._params[0]]               # PyTorch's cumulative LBFGS counters
-            self.n_epochs, self.n_lbfgs_steps, self.n_func_evals = epoch + 1, int(st.get('n_iter', 0)), int(st.get('func_evals', 0))
+            self.n_epochs = epoch + 1
+            self.n_lbfgs_steps = done_iters + int(st.get('n_iter', 0))
+            self.n_func_evals = done_evals + int(st.get('func_evals', 0))
+            self.stalled = stalls >= 2
             log.done(convg, epoch, current_loss,
                      f" ({self.n_lbfgs_steps} L-BFGS iterations, {self.n_func_evals} evaluations)")
             if convg == 0:
-                warnings.warn(f"LinearMixedModelSmoothing: LBFGS did not converge within max_iter={max_iter} "
-                              f"({self.n_lbfgs_steps} L-BFGS iterations in {epoch + 1} outer steps; "
-                              f"rel_loss={rel_loss:.2e}, grad_norm={grad_norm:.2e}).")
+                why = ("the line search stalled, also after a restart" if self.stalled
+                       else f"did not converge within max_iter={max_iter}")
+                warnings.warn(f"LinearMixedModelSmoothing: LBFGS {why} ({self.n_lbfgs_steps} L-BFGS iterations "
+                              f"in {epoch + 1} outer steps; rel_loss={rel_loss:.2e}, grad_norm={grad_norm:.2e}). "
+                              f"Try lr=1 or n_restarts > 1.")
 
         self.final_loss   = current_loss
         self.convg        = convg
@@ -596,12 +615,35 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         self._check_fit(check_hessian)
         return self
 
-    def variance_boundary(self, tol=1e-6):
-        """Adds the smooths whose prior variance share tau2 * mean ||NB_ij||^2 / var(y) is below tol."""
+    def _spline_labels(self):
+        return _fill_names(getattr(self, "spline_labels", None), self.len_spline, "spline")
+
+    def _tau_boundary(self, tol=1e-6):
+        """Ids of the smooths whose prior variance share tau2 * mean ||NB_ij||^2 / var(y) is below tol."""
         contrib = torch.split(self.U_grouped.pow(2).sum((0, 1)), self.K_list)
         vy, n = float(self.y_.var()), self.mask.sum()
-        return super().variance_boundary(tol) + [
-            f"tau2 s{s + 1}" for s, (t2, c) in enumerate(zip(self.tuning_params, contrib)) if t2 * c.sum() / n < tol * vy]
+        return [s for s, (t2, c) in enumerate(zip(self.tuning_params, contrib)) if t2 * c.sum() / n < tol * vy]
+
+    def variance_boundary(self, tol=1e-6):
+        """Adds the smooths on the boundary (see _tau_boundary). Their log(tau2 / sigma2) sits at its floor of
+        -20, so tau2 is reported as sigma2 * exp(-20) rather than 0."""
+        lab = self._spline_labels()
+        return super().variance_boundary(tol) + [f"tau2 s({lab[s]})" for s in self._tau_boundary(tol)]
+
+    def stuck_smooths(self, tol=1e-6, z=0.05):
+        """Boundary smooths whose REML score in tau2 (S+ - e, Zhang & Lin 2003) is positive at the fit, in units of
+        its information (z^2 / 2 ~ the REML gain). The criterion rises away from tau2 = 0 there, but the log tau2
+        gradient vanishes near 0, so the fit is stuck rather than at an optimum."""
+        on = self._tau_boundary(tol)
+        if not on:
+            return []
+        L, M = self._null_chol(self, list(range(self.len_spline))), self.mask.unsqueeze(-1)
+        out = []
+        for s in on:
+            S_plus, e, info = self._boundary_score(self.NB_list[s] * M, L)
+            if (S_plus - e) / info.clamp_min(1e-300).sqrt() > z:
+                out.append(s)
+        return out
 
     # --- Fixed-effect hypothesis testing (Satterthwaite; σ² profiled, in θ as log σ²) ---
     # Reuses the inherited fixed_t_test / _contrast_test; only the
@@ -616,10 +658,10 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         return torch.cat(parts)
 
     def _theta_names(self):
-        names = self._D_names(self.D_params.numel()) + [f"log tau2 s{s + 1}" for s in range(self.len_spline)]
+        names = self._D_names(self.D_params.numel()) + [f"tau2 s({lab})" for lab in self._spline_labels()]
         if self._has_corr_params():
             names += [f"rho_raw[{k}]" for k in range(self.rho_raw.numel())]
-        return names + ["log sigma2"]
+        return names + ["sigma2"]
 
     def _split_theta(self, theta):
         n_d, n_s = self.D_params.numel(), self.spline_params.numel()
@@ -683,7 +725,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
             device=self.device, y=y, X=self.X_, Z=self.Z_, id=self.id_, spline_inputs=NB,
             corr_structure=self.corr_structure, rand_D_type=self.rand_D_type,
             rand_D_estimate=self.rand_D_estimate)
-        return self._fit_null_model(null, nfk, f"linearity_test(s={s})"), others
+        return self._fit_null_model(null, nfk, f"linearity_test(s={s}, {self._spline_labels()[s]})"), others
 
     def _null_chol(self, null, others):
         """Per-group Cholesky of the null's absolute marginal covariance V0, built from this model's
@@ -708,11 +750,15 @@ class LinearMixedModelSmoothing(LinearMixedModel):
             from scipy import stats
             null, _ = self._fit_null(s, null_fit_kwargs=null_fit_kwargs, fit_type=self.fit_type)
             gap = 2.0 * (null.final_loss - self.final_loss)
-            if gap < -1e-2:
-                warnings.warn(f"linearity_test(s={s}): the null refit reached a better criterion than the full fit "
-                              f"(by {-gap / 2:.3g}); the full fit is not at its optimum.")
-            stat = max(gap, 0.0)
-            out = {"statistic": stat, "df": 1.0, "p_value": float(0.5 * stats.chi2.sf(stat, 1)) if stat > 0 else 1.0}
+            if gap < -1e-2:                       # the null is nested in the full model, so this is invalid
+                warnings.warn(f"linearity_test(s={s}, {self._spline_labels()[s]}): the null refit reached a better "
+                              f"criterion than the full fit (by {-gap / 2:.3g}), so the full fit is not at its "
+                              f"optimum; p_value is NaN. Refit (e.g. lr=1, n_restarts > 1) and retest.")
+                out = {"statistic": float("nan"), "df": 1.0, "p_value": float("nan")}
+            else:
+                stat = max(gap, 0.0)
+                out = {"statistic": stat, "df": 1.0,
+                       "p_value": float(0.5 * stats.chi2.sf(stat, 1)) if stat > 0 else 1.0}
         elif test == "score":
             self._warn_if_ml("linearity_test")
             null, others = self._fit_null(s, null_fit_kwargs=null_fit_kwargs)

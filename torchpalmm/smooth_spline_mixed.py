@@ -131,7 +131,16 @@ class SmoothingSplineMixed:
         self.y = _checktensor(y).to(device=self.device)
         self.Z = as2d(_checktensor(np.zeros((N, 0)) if Z is None else Z).to(device=self.device))
         self.pz = self.Z.shape[1]; self.px = self.X.shape[1]
-        self.x_center = torch.zeros(self.px, dtype=self.X.dtype, device=self.device)
+        self.spline_inputs = as2d(_checktensor(spline_inputs).to(device=self.device))
+        for what, T, nm in (("y", self.y.reshape(N, -1), ["y"]), ("X", self.X, self.x_names),
+                            ("Z", self.Z, self.re_names), ("spline_inputs", self.spline_inputs, self.spline_names)):
+            bad = (~torch.isfinite(T)).sum(0)
+            if bad.any():
+                cols = [f"{nm[j] if nm else j} ({int(bad[j])} rows)" for j in bad.nonzero().flatten().tolist()]
+                raise ValueError(f"{what} has missing or non-finite values in column(s) {', '.join(cols)}; drop or "
+                                 f"impute those rows (from_dataframe drops them). Inactive smooth_mask rows need "
+                                 f"finite placeholder values too.")
+        self.x_center =torch.zeros(self.px, dtype=self.X.dtype, device=self.device)
         self.x_scale = torch.ones_like(self.x_center)
         self.standardize = bool(standardize) and self.px > 0
         if self.standardize:
@@ -140,9 +149,10 @@ class SmoothingSplineMixed:
             self.X = (self.X - self.x_center) / self.x_scale
         ids = obs_id.cpu().numpy() if torch.is_tensor(obs_id) else np.asarray(obs_id)
         codes, self.group_labels = pd.factorize(ids.reshape(-1), sort=True)
+        if (codes < 0).any():
+            raise ValueError(f"obs_id has {(codes < 0).sum()} missing values; drop those rows.")
         obs_id = torch.as_tensor(codes, device=self.device)
         self.nmax = int(torch.bincount(obs_id).max())
-        self.spline_inputs = as2d(_checktensor(spline_inputs).to(device=self.device))
         self.obs_id = obs_id
 
         S = self.spline_inputs.shape[1]
@@ -233,6 +243,8 @@ class SmoothingSplineMixed:
         self.lmm = LinearMixedModelSmoothing(device=self.device, y=self.y, X=self.X_fit, Z=self.Z,
                                             spline_inputs=self.NB_list,
                                             id=self.obs_id, corr_structure=self.corr_structure, rand_D_type=self.rand_D_type, rand_D_estimate=self.rand_D_estimate)
+        self.lmm.re_labels = _fill_names(self.re_names, self.pz, "b")
+        self.lmm.spline_labels = _fill_names(self.spline_names, self.spline_inputs.shape[1], "spline")
         self.lmm.fit_likelihood(lr=lr, max_iter=max_iter, tol=tol, verbose=verbose, optimizer=optimizer, fit_type=fit_type, warm_start=warm_start,
                                     max_iter_inner=max_iter_inner, convg_check=convg_check, grad_control_tol=grad_control_tol, tau_lr_mult=tau_lr_mult,
                                     corr_init_method=rho_init, check_hessian=check_hessian)
@@ -265,6 +277,31 @@ class SmoothingSplineMixed:
             if verbose:
                 print(f"  kept {'the initial fit' if best_k == 0 else f'restart {best_k}'}: "
                       f"loss = {best.final_loss:.6f}")
+
+        # A smooth on the boundary with a positive REML score is stuck there, not at an optimum: refit once
+        # with those smooths restarted at tau2 = sigma2 and keep the lower criterion.
+        stuck = self.lmm.stuck_smooths()
+        if stuck:
+            prev, lab = copy.deepcopy(self.lmm), self.lmm._spline_labels()
+            init = dict(D_params=prev.D_params.detach(), spline_params=prev.spline_params.detach().clone())
+            init["spline_params"][stuck] = 0.0
+            if prev._has_corr_params():
+                init["rho_raw"] = prev.rho_raw.detach()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self.lmm.fit_likelihood(**{**prev._fit_settings, "verbose": False}, fit_type=fit_type,
+                                        warm_start=warm_start, init=init, check_hessian=check_hessian)
+            gain = prev.final_loss - self.lmm.final_loss
+            if gain > 0:
+                self.lmm._check_fit(check_hessian)               # re-issue the kept refit's own flags
+            else:
+                self.lmm = prev
+            still = self.lmm.stuck_smooths()
+            warnings.warn(f"smooth(s) {', '.join(lab[s] for s in stuck)} sat on the boundary with a positive REML "
+                          f"score (stuck, not optimal). A refit from tau2 = sigma2 "
+                          + (f"lowered the criterion by {gain:.3g} and was kept (converged: {bool(self.lmm.convg)})"
+                             if gain > 0 else "did not lower the criterion")
+                          + (f"; still stuck: {', '.join(lab[s] for s in still)}" if still else "") + ".")
 
         self.sigma2 = self.lmm.sigma2.detach()
         self.resid_cov = self.sigma2 * self.lmm.resid_corr().detach()
@@ -661,7 +698,7 @@ class SmoothingSplineMixed:
             edf, w_stat, w_df, p_wald = self._wald_smooth(c, fdf[fdf["spline_id"] == c], H, L_H, lam)
             conflict = bool(nonlin["p_value"] < alpha and edf < 1.01)
             if conflict:
-                warnings.warn(f"spline {c}: the {nonlinear_test} test rejects linearity (p = {nonlin['p_value']:.3g}) "
+                warnings.warn(f"s({self.lmm._spline_labels()[c]}) (s={c}): the {nonlinear_test} test rejects linearity (p = {nonlin['p_value']:.3g}) "
                               f"but the main fit has EDF = {edf:.3f} (tau2 ~ 0), so the null refit and the main fit "
                               f"disagree (null converged: {nonlin['null_converged']}). Check both fits' convergence "
                               f"and compare nonlinear_test='lrt'.")
@@ -683,7 +720,8 @@ class SmoothingSplineMixed:
         S = self.spline_inputs.shape[1]
         names = _fill_names(names if names is not None else self.x_names, self.px, "X")
         sp = _fill_names(spline_names if spline_names is not None else self.spline_names, S, "spline")
-        re_names = re_names if re_names is not None else self.re_names
+        re_names = _fill_names(re_names if re_names is not None else self.re_names, self.pz, "b")
+        self.lmm.re_labels, self.lmm.spline_labels = re_names, sp       # warnings below use the same labels
         icpt = "(Intercept, X at mean)" if self.x_center.any() else "(Intercept)"
         coefs = self.lmm.coef_table(names=names + [icpt] + [f"s({n}) linear" for n in sp] + self.level_names,
                                         alpha=alpha)

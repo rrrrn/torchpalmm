@@ -44,6 +44,12 @@
 
 `fit` returns the underlying `LinearMixedModelSmoothing` and sets `beta`, `D`, `sigma2`, `tau_sq_list` (one smoothing variance per smooth), `rho` and `boundary` (variance components estimated at ~0) on the model. With L-BFGS, `max_iter` is split into `max_iter // max_iter_inner` outer steps; the log and warnings report the actual number of L-BFGS iterations. Fits warn when subjects have rank(Z_i) < q (e.g. fewer rows than random effects), when sigma^2 falls below 0.1% of var(y), and when a variance component sits on the boundary.
 
+- The gradient norm in the log and in the stopping rules is evaluated at each accepted iterate. An outer step with no progress and a gradient norm of at least `grad_control_tol` is a stalled line search: L-BFGS restarts once from steepest descent, and a second stall in a row ends the fit as not converged (`lmm.stalled`). Stalled steps never count toward `plateau_patience`.
+- log(tau2 / sigma2) has a floor of -20, so a smooth on the boundary reports tau2 = sigma2 * exp(-20) rather than 0, and is listed in `boundary`.
+- On the log scale the gradient vanishes near tau2 = 0, so a smooth can get stuck there. After fitting, every smooth on the boundary is checked with its REML score in tau2. If the score is positive (the criterion rises away from 0), the model is refit once with those smooths restarted at tau2 = sigma2, the lower criterion is kept, and a warning reports the outcome (`lmm.stuck_smooths()`).
+- Missing or non-finite values in `y`, `X`, `Z`, `spline_inputs` or `obs_id` raise an error that names the column.
+- Labels: the variance table, `boundary` and the Hessian warnings use the same names (`Var(<re name>)`, `tau2 s(<spline name>)`). Warnings about a smooth also give its 0-based index `s` as used by `linearity_test`.
+
 ## After fitting
 
 | call | returns |
@@ -58,7 +64,7 @@
 | `convergence_diagnostics()` | gradient norm, Hessian eigenvalues, flat directions and boundary components |
 | `AIC()` | AIC from the ML log-likelihood at the fitted estimates (use an ML fit) |
 | `fixed_t_test(l)` | Satterthwaite t-test [2] for a fixed-effect contrast `l` |
-| `linearity_test(s, test)` | H0: smooth `s` is linear; `test="score"` (variance-component score test [6, 7]) or `"lrt"` (likelihood ratio with the 50:50 chi2_0 / chi2_1 boundary mixture [9, 10]) |
+| `linearity_test(s, test)` | H0: smooth `s` is linear; `test="score"` (variance-component score test [6, 7]) or `"lrt"` (likelihood ratio with the 50:50 chi2_0 / chi2_1 boundary mixture [9, 10]; p is NaN, with a warning, when the null refit beats the full fit, which shows the full fit is not at its optimum) |
 | `spline_effect_test(s, nonlinear_test)` | H0: smooth `s` is zero (Fisher-combined and Wald p-values); reports the nonlinearity test used, whether its null refit converged, and `edf_conflict` when linearity is rejected while the main fit's EDF is ~1 |
 
 The score tests (`linearity_test`, `spline_effect_test`, `random_effect_test`) are REML-based: their null model is always refit by REML, and they warn when called on an ML fit. Use ML fits for `lrt_test` on fixed effects. Null refits inherit the main fit's optimizer settings, start from its estimates, take overrides through `null_fit_kwargs`, and warn if they do not converge.
