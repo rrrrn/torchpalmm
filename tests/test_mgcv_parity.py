@@ -28,6 +28,7 @@ kn <- scan("{knots}", quiet = TRUE)
 m <- gam(y ~ x + s(t, bs = "cr", k = length(kn)) + s(id, bs = "re"), data = d, method = "REML",
          knots = list(t = kn))
 vc <- gam.vcomp(m)
+if (is.list(vc)) vc <- vc$vc          # mgcv >= 1.9-4 returns a list holding the matrix
 tg <- sort(unique(d$t)); g <- d[rep(1, length(tg)), ]; g$t <- tg
 f <- predict(m, g, type = "terms")[, "s(t)"]
 out <- c(vc["scale", "std.dev"]^2, vc["s(t)", "std.dev"]^2, vc["s(id)", "std.dev"]^2, coef(m)[["x"]], f - mean(f))
