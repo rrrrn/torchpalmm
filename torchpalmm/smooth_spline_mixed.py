@@ -91,7 +91,8 @@ class SmoothingSplineMixed:
         return F[pad] * valid.unsqueeze(-1), group_indices
 
     @staticmethod
-    def prepare_design_matrix(original_vec, unique_vec, ids):
+    def prepare_design_matrix(original_vec, unique_vec, ids, flat=False):
+        """flat=True returns NB per row, [N, K], instead of padded per subject, [G, nmax, K]."""
         unique_vec = torch.sort(unique_vec, descending=False)[0]
         Q, R = SmoothingSplineMixed.construct_Omega(unique_vec)
 
@@ -100,11 +101,14 @@ class SmoothingSplineMixed:
         S = torch.linalg.solve_triangular(C, I, upper=False)
         L = Q @ S
 
-        Nmtx, group_indices = SmoothingSplineMixed.construct_incidence_matrix(original_vec, unique_vec, ids)
-
         # random-effect design for the spline: B = L (L'L)^{-1}
         B = torch.linalg.pinv(L).T
-        NB = Nmtx @ B
+        if flat:
+            NB = SmoothingSplineMixed.basis_matrix(original_vec.to(torch.float64), unique_vec) @ B
+            group_indices = [(ids == g).nonzero(as_tuple=True)[0] for g in torch.unique(ids)]
+        else:
+            Nmtx, group_indices = SmoothingSplineMixed.construct_incidence_matrix(original_vec, unique_vec, ids)
+            NB = Nmtx @ B
 
         # [1, x] parametric part
         input_tilde = torch.stack((torch.ones_like(original_vec), original_vec), dim=1)
@@ -158,6 +162,7 @@ class SmoothingSplineMixed:
         S = self.spline_inputs.shape[1]
         m = self._check_mask(smooth_mask, S)
         self.smooth_mask = m
+        self._flat = self._splits_subjects(m, obs_id)
         nk = list(n_knots) if isinstance(n_knots, (list, tuple)) else [n_knots] * S
         # distinct x on the rows where the spline is active (all rows when unmasked); the knots unless n_knots
         self.unique_spline_vec, self.knots = [], []
@@ -172,8 +177,10 @@ class SmoothingSplineMixed:
         self.spline_linear_center = []
         for i in range(S):
             sp = self.spline_inputs[:, i]
-            NB, B, input_tilde, _, group_indices = self.prepare_design_matrix(sp, self.knots[i], obs_id)
-            if m is not None:
+            NB, B, input_tilde, _, group_indices = self.prepare_design_matrix(sp, self.knots[i], obs_id, flat=self._flat)
+            if self._flat:
+                NB = NB * m[:, i:i + 1]
+            elif m is not None:
                 pad = torch.nn.utils.rnn.pad_sequence(group_indices, batch_first=True)
                 valid = torch.arange(pad.shape[1], device=pad.device)[None, :] < torch.tensor(
                     [g.numel() for g in group_indices], device=pad.device)[:, None]
@@ -205,6 +212,15 @@ class SmoothingSplineMixed:
         self.obs_flat_idx = obs_flat_idx
 
         self.X_fit = X_fit.to(device=self.device)
+
+    def _splits_subjects(self, m, obs_id):
+        """True when the masks split the subjects into several independent blocks of smooths (e.g. one curve
+        per subject-level group) and the iid Woodbury path applies. NB_list is then per row, [N, K], and the
+        REML runs per block; otherwise (no mask, masks within subjects) the padded dense path is unchanged."""
+        iid = self.corr_structure is None or LinearMixedModelSmoothing._structure_kind(self.corr_structure) == "iid"
+        if m is None or not iid or self.pz >= self.nmax:
+            return False
+        return bool(LinearMixedModelSmoothing.smooth_blocks(m != 0, obs_id)[0].max() > 0)
 
     def _check_mask(self, smooth_mask, S):
         """Validate the N x S activation mask (None = every spline active on every row)."""
@@ -413,8 +429,7 @@ class SmoothingSplineMixed:
             b_hat = torch.zeros((G, self.pz), device=device, dtype=f64)
             if self.pz:
                 D_rel = self.D / self.sigma2
-                W = lmm._wb_W
-                q = W[..., p:p + 1] - W[..., :p] @ self.beta - W[..., p + 1:] @ a_hat.unsqueeze(-1)
+                q = lmm._wb_resid(self.beta, a_hat)
                 t = torch.cholesky_solve(q, lmm._woodbury_chol(D_rel))
                 b_hat = (D_rel @ lmm._wb_R.transpose(-1, -2) @ t).squeeze(-1)
             self.rand_effects = b_hat.detach()
@@ -446,7 +461,7 @@ class SmoothingSplineMixed:
 
     def _gram(self):
         """[X y U]' B^-1 [X y U] with B = sigma^2 R + Z D Z' at the fit (iid fast path)."""
-        return self.lmm._woodbury_forms(self.D / self.sigma2)[1] / self.sigma2
+        return self.lmm._woodbury_dense(self.D / self.sigma2)[1] / self.sigma2
 
     def _posterior_precision(self):
         """Posterior precision H of (beta, a) given the REML variance components, and the
@@ -645,7 +660,7 @@ class SmoothingSplineMixed:
             raise ValueError("Model not fitted yet.")
         return self.lmm.AIC()
 
-    def _wald_smooth(self, c, fitted, H, L_H, lam):
+    def _wald_smooth(self, c, fitted, H, Hinv, lam):
         """Wood (2013) Wald test of H0: f_c = 0, f_c = slope * (x - center) + B_c a_c, at the
         observed x. Statistic f' V_f^- f with V_f = Cov(f | y) truncated to rank
         r = round(edf). Returns (edf, stat, r, p)."""
@@ -659,7 +674,6 @@ class SmoothingSplineMixed:
 
         E = self._smooth_design(c, intercept=False)[:, cols]
 
-        Hinv = torch.cholesky_solve(torch.eye(p + K, dtype=f64, device=dev), L_H)
         pen = torch.cat([torch.zeros(p, dtype=f64, device=dev), 1.0 / lam])
         edf = torch.diagonal(Hinv @ (H - torch.diag(pen)))[cols].sum().item()
 
@@ -687,6 +701,7 @@ class SmoothingSplineMixed:
         from scipy import stats
         H, lam = self._posterior_precision()
         L_H, _ = self.lmm._robust_cholesky(H)
+        Hinv = torch.cholesky_solve(torch.eye(H.shape[0], dtype=torch.float64, device=self.device), L_H)
         fdf = self.get_blup(random_effects=False)[0]
 
         rows = []
@@ -695,7 +710,7 @@ class SmoothingSplineMixed:
             nonlin = self.lmm.linearity_test(s=c, alpha=alpha, null_fit_kwargs=null_fit_kwargs, test=nonlinear_test)
             stat = -2.0 * np.log(np.maximum([lin["p_value"], nonlin["p_value"]], 1e-300)).sum()
             p_fisher = float(stats.chi2.sf(stat, 4))
-            edf, w_stat, w_df, p_wald = self._wald_smooth(c, fdf[fdf["spline_id"] == c], H, L_H, lam)
+            edf, w_stat, w_df, p_wald = self._wald_smooth(c, fdf[fdf["spline_id"] == c], H, Hinv, lam)
             conflict = bool(nonlin["p_value"] < alpha and edf < 1.01)
             if conflict:
                 warnings.warn(f"s({self.lmm._spline_labels()[c]}) (s={c}): the {nonlinear_test} test rejects linearity (p = {nonlin['p_value']:.3g}) "

@@ -23,13 +23,23 @@ class LinearMixedModelSmoothing(LinearMixedModel):
 
         # Global smooth design U = [NB_1|…|NB_S]; the smooth is one shared
         # random vector per component, handled via Woodbury in the REML loss.
-        self.K_list    = [int(NB.shape[2]) for NB in self.NB_list]
+        self.K_list    = [int(NB.shape[-1]) for NB in self.NB_list]
         self.K_tot     = int(sum(self.K_list))
         self._K_repeats = torch.tensor(self.K_list, device=self.device)
+        self._woodbury = self._corr_kind() == "iid" and self.pz < self.nmax
+
+        # Per-row bases [N, K] (masks that split the subjects, see smooth_blocks) take the blocked
+        # Woodbury path; padded [G, nmax, K] bases take the dense one.
+        flat = self.NB_list[0].dim() == 2
+        if flat and not self._woodbury:
+            self.NB_list = [self._pad_rows(NB) for NB in self.NB_list]
+        self._blocked = flat and self._woodbury
+        if self._blocked:
+            self._setup_blocks()
+            return
         self.U_grouped = torch.cat([NB * mask_3d for NB in self.NB_list],
                                    dim=2)
 
-        self._woodbury = self._corr_kind() == "iid" and self.pz < self.nmax
         if self._woodbury:
             A = torch.cat([self.masked_X, self.masked_y.unsqueeze(-1), self.U_grouped], dim=2)
             if self.pz:
@@ -39,6 +49,75 @@ class LinearMixedModelSmoothing(LinearMixedModel):
             A = A.reshape(-1, A.shape[-1])
             self._wb_base = A.transpose(0, 1) @ A
             self._wb_pad_logdet = (self.n_groups * self.nmax - self.mask.sum().item()) * math.log(1e6)
+
+    @staticmethod
+    def smooth_blocks(active, gid):
+        """Blocks of smooths that no subject links. active [N, S]: row uses smooth; gid [N]: subject index.
+        Two smooths share a block when one subject has active rows in both, so A_UU is block diagonal over
+        blocks. Returns (block of each smooth [S], block of each subject [G], 0 for a subject with none)."""
+        from scipy.sparse.csgraph import connected_components
+        f64 = torch.float64
+        inc = torch.zeros(int(gid.max()) + 1, active.shape[1], dtype=f64, device=active.device)
+        inc = inc.index_add_(0, gid, active.to(f64)) > 0
+        link = (inc.T.to(f64) @ inc.to(f64) > 0).cpu().numpy()
+        blk_s = torch.as_tensor(connected_components(link, directed=False)[1], device=active.device).long()
+        blk_g = (inc.long() * (blk_s + 1)).amax(1).clamp_min(1) - 1
+        return blk_s, blk_g
+
+    @staticmethod
+    def _slots(lab, nb):
+        """Row b lists the indices i with lab[i] = b, [nb, max count], padded with len(lab)."""
+        order = torch.argsort(lab, stable=True)
+        cnt = torch.bincount(lab, minlength=nb)
+        pos = torch.arange(lab.numel(), device=lab.device) - (cnt.cumsum(0) - cnt)[lab[order]]
+        out = torch.full((nb, int(cnt.max())), lab.numel(), dtype=torch.long, device=lab.device)
+        out[lab[order], pos] = order
+        return out
+
+    def _pad_rows(self, T):
+        """Per-row T [N, K] in the padded per-subject layout [G, nmax, K]."""
+        out = T.new_zeros(self.n_groups, self.nmax, T.shape[1])
+        out[self.mask.bool()] = T[torch.cat(self._group_idx)]
+        return out
+
+    def _masked_basis(self, s):
+        """Smooth s's basis in the padded per-subject layout, [G, nmax, K_s]."""
+        return self._pad_rows(self.NB_list[s]) if self._blocked else self.NB_list[s] * self.mask.unsqueeze(-1)
+
+    def _setup_blocks(self):
+        """Woodbury pieces per block of smooths (smooth_blocks), from the real rows only. Columns [X y U_b],
+        U_b the block's smooths side by side, padded to the widest block; subjects padded to the largest."""
+        dev, N, G, pz = self.device, self.y_.shape[0], self.n_groups, self.pz
+        gid = torch.unique(self.id_, return_inverse=True)[1]
+        blk_s, blk_g = self.smooth_blocks(torch.stack([NB.ne(0).any(1) for NB in self.NB_list], 1), gid)
+        nb, K = int(blk_s.max()) + 1, self._K_repeats
+        Kb = torch.nn.functional.one_hot(blk_s, nb) * K[:, None]
+        loc = (Kb.cumsum(0) - Kb)[torch.arange(len(K), device=dev), blk_s]       # first column of each smooth in its block
+        cols = torch.arange(self.K_tot, device=dev)
+        self._col_ext = torch.full((nb, int(Kb.sum(0).max())), self.K_tot, dtype=torch.long, device=dev)
+        self._col_ext[torch.repeat_interleave(blk_s, K), torch.repeat_interleave(loc - (K.cumsum(0) - K), K) + cols] = cols
+        U = self.y_.new_zeros(N, self._col_ext.shape[1])
+        for NB, l in zip(self.NB_list, loc.tolist()):
+            U[:, l:l + NB.shape[1]] += NB
+        A = torch.cat([self.X_, self.y_, U], dim=1)
+        if pz:
+            Q, self._wb_R = torch.linalg.qr(self.masked_Z)
+            Qr = Q.new_zeros(N, pz)
+            Qr[torch.cat(self._group_idx)] = Q[self.mask.bool()]
+            W = A.new_zeros(G, pz, A.shape[1]).index_add_(0, gid, Qr.unsqueeze(-1) * A.unsqueeze(1))
+            A = A - (Qr.unsqueeze(1) @ W[gid]).squeeze(1)
+        Ab = torch.cat([A, A.new_zeros(1, A.shape[1])])[self._slots(blk_g[gid], nb)]
+        self._wb_base = Ab.transpose(-1, -2) @ Ab
+        self._grp_blk, self._grp_idx = blk_g, self._slots(blk_g, nb)
+        if pz:
+            # The dense path's Gram also has the padding rows of A - QW, which are -Q_pad W when QR puts part
+            # of Q there (a subject with fewer rows than random effects); add their share W' Q_pad' Q_pad W.
+            Qp = Q * (1.0 - self.mask).unsqueeze(-1)
+            C = torch.cat([Qp.transpose(-1, -2) @ Qp, Q.new_zeros(1, pz, pz)])[self._grp_idx]
+            self._wb_W = W
+            self._wb_Wb = torch.cat([W, W.new_zeros(1, pz, W.shape[2])])[self._grp_idx]
+            self._wb_base = self._wb_base + torch.einsum("bgzi,bgzj->bij", self._wb_Wb, C @ self._wb_Wb)
+        self._wb_pad_logdet = (G * self.nmax - self.mask.sum().item()) * math.log(1e6)
 
     # Relative residual structures. Diagonal uses an identified variance-ratio
     # representation because the common residual scale σ² is profiled out.
@@ -172,9 +251,10 @@ class LinearMixedModelSmoothing(LinearMixedModel):
 
     def initialize_rand_D(self, type="unstructured", estimate="sample",
                           corr_init_method="moment"):
+        n_pad = self.n_groups * self.nmax                  # both paths average over the padded layout
         spline_param = torch.tensor([
-            self.NB_list[i].pow(2).mean().sqrt().item()
-            for i in range(self.len_spline)
+            (NB.pow(2).sum() / (n_pad * NB.shape[1])).sqrt().item() if self._blocked else NB.pow(2).mean().sqrt().item()
+            for NB in self.NB_list
         ], device=self.device, dtype=self.y_.dtype)
         rho_init = torch.log(spline_param ** 2).clamp(min=0.0)  # log(τ²), clamped so τ²≥1 (under-smoothed start)
 
@@ -229,8 +309,49 @@ class LinearMixedModelSmoothing(LinearMixedModel):
             return self._wb_pad_logdet, self._wb_base
         L_T = self._woodbury_chol(D)
         logdetB = 2.0 * torch.log(torch.diagonal(L_T, dim1=-2, dim2=-1)).sum() + self._wb_pad_logdet
+        if self._blocked:                                  # one [P_b, P_b] matrix per block, columns [X y U_b]
+            Wb = self._wb_Wb
+            L_b = torch.cat([L_T, torch.eye(self.pz, dtype=L_T.dtype, device=self.device).unsqueeze(0)])[self._grp_idx]
+            return logdetB, self._wb_base + torch.einsum("bgzi,bgzj->bij", Wb, torch.cholesky_solve(Wb, L_b))
         W = self._wb_W
         return logdetB, self._wb_base + torch.einsum("gzi,gzj->ij", W, torch.cholesky_solve(W, L_T))
+
+    def _woodbury_dense(self, D):
+        """_woodbury_forms with the blocks placed in one dense matrix, global column order [X y U]."""
+        logdetB, A = self._woodbury_forms(D)
+        if not self._blocked:
+            return logdetB, A
+        q = self.X_.shape[1] + 1
+        P = q + self.K_tot
+        idx = torch.cat([torch.arange(q, device=self.device).expand(A.shape[0], q), self._col_ext + q], 1)
+        out = A.new_zeros(P + 1, P + 1).index_put_((idx[:, :, None], idx[:, None, :]), A, accumulate=True)
+        return logdetB, out[:P, :P]
+
+    def _wb_resid(self, beta, a):
+        """Q_i'(y_i - X_i beta - U_i a) per subject, [G, pz, 1] (iid Woodbury path)."""
+        p, W = self.X_.shape[1], self._wb_W
+        if self._blocked:
+            a = torch.cat([a, a.new_zeros(1)])[self._col_ext][self._grp_blk]      # each subject's block of a
+        return W[..., p:p + 1] - W[..., :p] @ beta - W[..., p + 1:] @ a.unsqueeze(-1)
+
+    def _blocked_forms(self, D, lam, lam_inv):
+        """logdetV, X'V^-1X, X'V^-1y, y'V^-1y on the blocked path: M = A_UU + Λ^-1 is block diagonal, so
+        its log-determinant and solves run per block (padding columns get M = 1)."""
+        q = self.X_.shape[1] + 1
+        logdetB, A = self._woodbury_forms(D)
+        A_UV = A[:, q:, :q]
+        M = A[:, q:, q:] + torch.diag_embed(torch.cat([lam_inv, lam_inv.new_ones(1)])[self._col_ext])
+        M = 0.5 * (M + M.transpose(-1, -2))
+        L_M, _ = self._robust_cholesky(M)
+        logdetV = logdetB + torch.sum(torch.log(lam)) + 2.0 * torch.log(torch.diagonal(L_M, dim1=-2, dim2=-1)).sum()
+        S = A[:, :q, :q].sum(0) - (A_UV.transpose(-1, -2) @ torch.cholesky_solve(A_UV, L_M)).sum(0)
+        return logdetV, S[:q - 1, :q - 1], S[:q - 1, q - 1:], S[q - 1, q - 1]
+
+    def _reml_finish(self, logdetV, XtVinvX, XtVinvy, ytVinvy):
+        beta_hat       = torch.linalg.solve(XtVinvX, XtVinvy)
+        rVinv_r        = ytVinvy - (XtVinvy.transpose(0, 1) @ beta_hat).squeeze()
+        logdet_XtVinvX = self._logdet_spd(XtVinvX)
+        return logdetV, logdet_XtVinvX, rVinv_r, XtVinvX, beta_hat
 
     def _reml_relative(self, D, spline_param, R):
         """Relative-scale REML pieces (σ² profiled out). R is the unit-diagonal residual
@@ -243,6 +364,8 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         lam     = torch.repeat_interleave(tau_sq, self._K_repeats)
         lam_inv = 1.0 / lam
 
+        if self._blocked:
+            return self._reml_finish(*self._blocked_forms(D, lam, lam_inv))
         if self._woodbury:
             logdetB, A = self._woodbury_forms(D)
             A_XX, A_Xy, A_yy = A[:p, :p], A[:p, p:p + 1], A[p, p]
@@ -283,11 +406,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         XtVinvX = A_XX - A_UX.transpose(0, 1) @ Minv_UX
         XtVinvy = A_Xy - A_UX.transpose(0, 1) @ Minv_Uy
         ytVinvy = A_yy - (A_Uy.transpose(0, 1) @ Minv_Uy).squeeze()
-
-        beta_hat       = torch.linalg.solve(XtVinvX, XtVinvy)
-        rVinv_r        = ytVinvy - (XtVinvy.transpose(0, 1) @ beta_hat).squeeze()
-        logdet_XtVinvX = self._logdet_spd(XtVinvX)
-        return logdetV, logdet_XtVinvX, rVinv_r, XtVinvX, beta_hat
+        return self._reml_finish(logdetV, XtVinvX, XtVinvy, ytVinvy)
 
     def loss_fn_reml(self, D, spline_param):
         """Profiled REML for V = B + UΛUᵀ: B = blockdiag(R + ZDZᵀ) per group,
@@ -620,7 +739,8 @@ class LinearMixedModelSmoothing(LinearMixedModel):
 
     def _tau_boundary(self, tol=1e-6):
         """Ids of the smooths whose prior variance share tau2 * mean ||NB_ij||^2 / var(y) is below tol."""
-        contrib = torch.split(self.U_grouped.pow(2).sum((0, 1)), self.K_list)
+        sq = torch.cat([NB.pow(2).sum(0) for NB in self.NB_list]) if self._blocked else self.U_grouped.pow(2).sum((0, 1))
+        contrib = torch.split(sq, self.K_list)
         vy, n = float(self.y_.var()), self.mask.sum()
         return [s for s, (t2, c) in enumerate(zip(self.tuning_params, contrib)) if t2 * c.sum() / n < tol * vy]
 
@@ -637,10 +757,10 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         on = self._tau_boundary(tol)
         if not on:
             return []
-        L, M = self._null_chol(self, list(range(self.len_spline))), self.mask.unsqueeze(-1)
+        L = self._null_chol(self, list(range(self.len_spline)))
         out = []
         for s in on:
-            S_plus, e, info = self._boundary_score(self.NB_list[s] * M, L)
+            S_plus, e, info = self._boundary_score(self._masked_basis(s), L)
             if (S_plus - e) / info.clamp_min(1e-300).sqrt() > z:
                 out.append(s)
         return out
@@ -733,7 +853,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         resid = (null.sigma2 * null.resid_corr()).expand(self.n_groups, -1, -1).clone()
         for j, tau2 in zip(others, null.tuning_params.tolist()):
             k0  = sum(self.K_list[:j])
-            U_j = self.U_grouped[:, :, k0:k0 + self.K_list[j]]
+            U_j = self._pad_rows(self.NB_list[j]) if self._blocked else self.U_grouped[:, :, k0:k0 + self.K_list[j]]
             resid.baddbmm_(U_j, U_j.transpose(-1, -2), alpha=tau2)      # += tau^2 NB NB'
         return self._robust_cholesky(self._group_cov(resid, null.D))[0]
 
@@ -762,8 +882,7 @@ class LinearMixedModelSmoothing(LinearMixedModel):
         elif test == "score":
             self._warn_if_ml("linearity_test")
             null, others = self._fit_null(s, null_fit_kwargs=null_fit_kwargs)
-            S_plus, e, info = self._boundary_score(self.NB_list[s] * self.mask.unsqueeze(-1),
-                                                   self._null_chol(null, others))
+            S_plus, e, info = self._boundary_score(self._masked_basis(s), self._null_chol(null, others))
             out = self._boundary_pvalue(S_plus, e, info)
         else:
             raise ValueError('test must be "score" or "lrt".')
